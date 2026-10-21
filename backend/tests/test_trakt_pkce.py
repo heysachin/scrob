@@ -83,7 +83,7 @@ class TraktPkceUtilsTests(unittest.TestCase):
     def test_authorization_url_parameters(self):
         url = trakt_pkce.build_authorization_url(
             client_id="my-client-id",
-            redirect_uri="https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback",
+            redirect_uri="https://scrob.example.com/api/proxy/trakt/auth/pkce/callback",
             code_challenge="challenge123",
             state="state123",
         )
@@ -93,7 +93,7 @@ class TraktPkceUtilsTests(unittest.TestCase):
         self.assertIn("code_challenge=challenge123", url)
         self.assertIn("code_challenge_method=S256", url)
         self.assertIn("state=state123", url)
-        self.assertIn("redirect_uri=https%3A%2F%2Fscrob.sachindev.com%2Fapi%2Fproxy%2Ftrakt%2Fauth%2Fpkce%2Fcallback", url)
+        self.assertIn("redirect_uri=https%3A%2F%2Fscrob.example.com%2Fapi%2Fproxy%2Ftrakt%2Fauth%2Fpkce%2Fcallback", url)
 
     def test_redirect_uri_derivation_precedence(self):
         original_public = getattr(app_settings, "scrob_public_url", None)
@@ -111,10 +111,10 @@ class TraktPkceUtilsTests(unittest.TestCase):
             )
 
             # 2. SCROB_PUBLIC_URL overrides server_url
-            app_settings.scrob_public_url = "https://scrob.sachindev.com"
+            app_settings.scrob_public_url = "https://scrob.example.com"
             self.assertEqual(
                 trakt_pkce.get_trakt_redirect_uri(),
-                "https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback",
+                "https://scrob.example.com/api/proxy/trakt/auth/pkce/callback",
             )
 
             # 3. TRAKT_REDIRECT_URL overrides SCROB_PUBLIC_URL
@@ -237,7 +237,7 @@ class TraktPkceFlowTests(unittest.IsolatedAsyncioTestCase):
                 code_verifier=verifier,
                 user_id=1,
                 client_id="alice-client-id",
-                redirect_uri="https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback",
+                redirect_uri="https://scrob.example.com/api/proxy/trakt/auth/pkce/callback",
                 expires_at=utcnow() + timedelta(minutes=10),
             )
             s.add(tx)
@@ -266,7 +266,7 @@ class TraktPkceFlowTests(unittest.IsolatedAsyncioTestCase):
             mock_exchange.assert_called_once_with(
                 client_id="alice-client-id",
                 code="trakt-code-abc",
-                redirect_uri="https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback",
+                redirect_uri="https://scrob.example.com/api/proxy/trakt/auth/pkce/callback",
                 code_verifier=verifier,
             )
 
@@ -545,12 +545,12 @@ class TraktPkceRefreshTests(unittest.IsolatedAsyncioTestCase):
                 client_id="cid",
                 client_secret=None,
                 refresh_token="rt",
-                redirect_uri="https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback",
+                redirect_uri="https://scrob.example.com/api/proxy/trakt/auth/pkce/callback",
             )
             self.assertEqual(res["access_token"], "fresh")
             body = mock_post.call_args.kwargs["json"]
             self.assertNotIn("client_secret", body)
-            self.assertEqual(body["redirect_uri"], "https://scrob.sachindev.com/api/proxy/trakt/auth/pkce/callback")
+            self.assertEqual(body["redirect_uri"], "https://scrob.example.com/api/proxy/trakt/auth/pkce/callback")
 
     async def test_secretless_disconnect_and_revoke(self):
         current_u = User(id=1, email="alice@test.local", username="alice", api_key="k1")
