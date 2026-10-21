@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     secret_key: str
 
     server_url: str = "http://localhost:7330"
+    scrob_public_url: Optional[str] = None
 
     # Already set to UTC in the Dockerfiles (ENV TZ=UTC) for the container's own
     # system clock; reused here as the server-side "today" for pages that have
@@ -75,6 +76,7 @@ class Settings(BaseSettings):
     # Trakt.tv
     trakt_client_id: Optional[str] = None
     trakt_client_secret: Optional[str] = None
+    trakt_redirect_url: Optional[str] = None
 
     require_email_validation: bool = False
     smtp_address: Optional[str] = None

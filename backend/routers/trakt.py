@@ -10,14 +10,21 @@ Endpoints:
 """
 
 import asyncio
+import hmac
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
-from sqlalchemy import select, update
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core import trakt as trakt_client
+from core import trakt_pkce
+from core.config import settings as app_settings
+from core.limiter import limiter
 from core.enrichment import enrich_media, is_unmapped_tvdb_episode, create_media_safely
 from core.trakt_export import MAX_TOTAL_SIZE, TraktExportData, parse_trakt_export
 from core.rewatch import record_rewatch_progress
@@ -33,6 +40,7 @@ from models.media import Media
 from models.ratings import Rating, RatingChanges
 from models.show import Show
 from models.sync import SyncJob, SyncStatus
+from models.trakt_oauth import TraktOAuthTransaction
 from models.users import User, UserSettings
 from models.global_settings import GlobalSettings
 from sqlalchemy.orm.attributes import flag_modified
@@ -90,7 +98,7 @@ async def ensure_valid_trakt_token(
     if await trakt_client.validate_token(settings.trakt_client_id, settings.trakt_access_token):
         return settings.trakt_access_token
 
-    if not (settings.trakt_refresh_token and settings.trakt_client_secret):
+    if not settings.trakt_refresh_token:
         raise TraktTokenError("Trakt token expired. Please reconnect Trakt in Settings.")
 
     try:
@@ -98,13 +106,15 @@ async def ensure_valid_trakt_token(
             settings.trakt_client_id,
             settings.trakt_client_secret,
             settings.trakt_refresh_token,
+            redirect_uri=trakt_pkce.get_trakt_redirect_uri(),
         )
     except Exception as exc:
         logger.warning("Trakt token refresh failed for user %s: %s", settings.user_id, exc)
         raise TraktTokenError(f"Trakt token expired and the automatic refresh failed: {exc}") from exc
 
     settings.trakt_access_token = token_data["access_token"]
-    settings.trakt_refresh_token = token_data["refresh_token"]
+    if "refresh_token" in token_data:
+        settings.trakt_refresh_token = token_data["refresh_token"]
     settings.trakt_token_expires_at = token_data.get("expires_in", 0) + int(
         datetime.now(timezone.utc).timestamp()
     )
@@ -237,12 +247,225 @@ def _parse_trakt_datetime(value: str | None) -> datetime | None:
     return dt
 
 
-def _require_trakt_config(settings: UserSettings):
-    if not settings.trakt_client_id or not settings.trakt_client_secret:
+def _require_trakt_config(settings: UserSettings | None):
+    if not settings or not settings.trakt_client_id:
         raise HTTPException(
             status_code=503,
-            detail="Trakt Client ID and Client Secret are not configured. Add them in Settings → Sync → Trakt.",
+            detail="Trakt Client ID is not configured. Add it in Settings → Connections.",
         )
+
+
+def _require_trakt_device_config(settings: UserSettings | None):
+    if not settings or not settings.trakt_client_id or not settings.trakt_client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Trakt Client ID and Client Secret are required for device authentication.",
+        )
+
+
+# ── PKCE Authentication ───────────────────────────────────────────────────────
+
+class TraktPkceStartRequest(BaseModel):
+    client_id: Optional[str] = None
+
+
+class TraktPkceStartResponse(BaseModel):
+    authorization_url: str
+    expires_in: int = 600
+
+
+@router.post("/auth/pkce/start", response_model=TraktPkceStartResponse)
+@limiter.limit("30/minute")
+async def trakt_pkce_start(
+    request: Request,
+    payload: Optional[TraktPkceStartRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Initiate Trakt OAuth 2.0 PKCE flow. Returns authorization URL and expires_in."""
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
+    settings = result.scalar_one_or_none()
+    if not settings:
+        settings = UserSettings(user_id=current_user.id)
+        db.add(settings)
+
+    client_id = (
+        (payload.client_id.strip() if payload and payload.client_id else None)
+        or settings.trakt_client_id
+        or app_settings.trakt_client_id
+    )
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Trakt Client ID is not configured. Please enter your Client ID in Connections.",
+        )
+
+    if payload and payload.client_id and settings.trakt_client_id != client_id:
+        settings.trakt_client_id = client_id
+
+    # Clean up old abandoned expired transactions
+    try:
+        cleanup_cutoff = utcnow() - timedelta(hours=1)
+        await db.execute(
+            delete(TraktOAuthTransaction).where(TraktOAuthTransaction.expires_at < cleanup_cutoff)
+        )
+    except Exception as exc:
+        logger.debug("Failed to clean up expired OAuth transactions: %s", exc)
+
+    verifier = trakt_pkce.generate_code_verifier()
+    challenge = trakt_pkce.generate_code_challenge(verifier)
+    state = trakt_pkce.generate_oauth_state()
+    state_hash = trakt_pkce.hash_oauth_state(state)
+    redirect_uri = trakt_pkce.get_trakt_redirect_uri()
+    expires_at = utcnow() + timedelta(seconds=600)
+
+    tx = TraktOAuthTransaction(
+        state_hash=state_hash,
+        code_verifier=verifier,
+        user_id=current_user.id,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        expires_at=expires_at,
+    )
+    db.add(tx)
+    await db.commit()
+
+    auth_url = trakt_pkce.build_authorization_url(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=challenge,
+        state=state,
+    )
+
+    return TraktPkceStartResponse(
+        authorization_url=auth_url,
+        expires_in=600,
+    )
+
+
+@router.get("/auth/pkce/callback")
+async def trakt_pkce_callback(
+    request: Request,
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Handle Trakt OAuth 2.0 PKCE redirect callback.
+
+    Public endpoint reached directly from the user's browser redirect from Trakt.
+    Validates state atomically, exchanges authorization code for tokens, persists tokens,
+    and redirects the browser back to /connections.
+    """
+    if error:
+        logger.info("Trakt authorization was not granted by user: %s", error)
+        return RedirectResponse(
+            url="/connections?trakt=denied",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    if not code or not state:
+        logger.warning("Trakt PKCE callback received with missing code or state")
+        return RedirectResponse(
+            url="/connections?trakt=error&message=missing_parameters",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    state_hash = trakt_pkce.hash_oauth_state(state)
+    result = await db.execute(
+        select(TraktOAuthTransaction).where(TraktOAuthTransaction.state_hash == state_hash)
+    )
+    tx = result.scalar_one_or_none()
+
+    if tx is None or not hmac.compare_digest(tx.state_hash, state_hash):
+        logger.warning("Trakt PKCE callback: unknown OAuth state")
+        return RedirectResponse(
+            url="/connections?trakt=error&message=invalid_or_expired_state",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    if tx.consumed_at is not None:
+        logger.warning("Trakt PKCE callback: replayed OAuth state for user_id=%s", tx.user_id)
+        return RedirectResponse(
+            url="/connections?trakt=error&message=state_already_used",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    if tx.expires_at <= utcnow():
+        logger.warning("Trakt PKCE callback: expired OAuth state for user_id=%s", tx.user_id)
+        return RedirectResponse(
+            url="/connections?trakt=error&message=invalid_or_expired_state",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    # Atomically mark the transaction as consumed to prevent race conditions or replay
+    consume_stmt = (
+        update(TraktOAuthTransaction)
+        .where(
+            TraktOAuthTransaction.id == tx.id,
+            TraktOAuthTransaction.consumed_at.is_(None),
+        )
+        .values(consumed_at=utcnow())
+    )
+    consume_res = await db.execute(consume_stmt)
+    if consume_res.rowcount != 1:
+        logger.warning("Trakt PKCE callback: state was already consumed in concurrent request")
+        await db.rollback()
+        return RedirectResponse(
+            url="/connections?trakt=error&message=state_already_used",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    await db.commit()
+
+    # Exchange authorization code for Trakt access token
+    try:
+        token_data = await trakt_pkce.exchange_code_for_token(
+            client_id=tx.client_id,
+            code=code,
+            redirect_uri=tx.redirect_uri,
+            code_verifier=tx.code_verifier,
+        )
+    except Exception as exc:
+        logger.warning("Trakt PKCE token exchange failed for user_id=%s: %s", tx.user_id, exc)
+        return RedirectResponse(
+            url="/connections?trakt=error&message=token_exchange_failed",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        logger.warning("Trakt PKCE token response missing access_token for user_id=%s", tx.user_id)
+        return RedirectResponse(
+            url="/connections?trakt=error&message=token_exchange_failed",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in", 0)
+
+    user_settings_res = await db.execute(
+        select(UserSettings).where(UserSettings.user_id == tx.user_id)
+    )
+    user_settings = user_settings_res.scalar_one_or_none()
+    if not user_settings:
+        user_settings = UserSettings(user_id=tx.user_id)
+        db.add(user_settings)
+
+    user_settings.trakt_client_id = tx.client_id
+    user_settings.trakt_access_token = access_token
+    if refresh_token:
+        user_settings.trakt_refresh_token = refresh_token
+    user_settings.trakt_token_expires_at = int(datetime.now(timezone.utc).timestamp()) + expires_in
+    user_settings.trakt_device_code = None
+    user_settings.trakt_history_cursor_at = None
+    await db.commit()
+
+    logger.info("Trakt PKCE connection successfully established for user_id=%s", tx.user_id)
+    return RedirectResponse(
+        url="/connections?trakt=success",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 # ── Device Authentication ─────────────────────────────────────────────────────
@@ -259,7 +482,7 @@ async def trakt_device_start(
         settings = UserSettings(user_id=current_user.id)
         db.add(settings)
 
-    _require_trakt_config(settings)
+    _require_trakt_device_config(settings)
 
     data = await trakt_client.start_device_auth(settings.trakt_client_id)
 
@@ -286,7 +509,7 @@ async def trakt_device_poll(
     if not settings or not settings.trakt_device_code:
         raise HTTPException(status_code=400, detail="No pending device authorization. Call /auth/device/start first.")
 
-    _require_trakt_config(settings)
+    _require_trakt_device_config(settings)
 
     try:
         token_data = await trakt_client.poll_device_token(
@@ -325,7 +548,7 @@ async def trakt_disconnect(
     settings = result.scalar_one_or_none()
 
     if settings and settings.trakt_access_token:
-        if settings.trakt_client_id and settings.trakt_client_secret:
+        if settings.trakt_client_id:
             await trakt_client.revoke_token(
                 settings.trakt_client_id,
                 settings.trakt_client_secret,

@@ -9,7 +9,7 @@ Rate limits: 1000 requests per 5 minutes per user.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -123,35 +123,49 @@ async def poll_device_token(client_id: str, client_secret: str, device_code: str
         return None
 
 
-async def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict:
-    """Exchange a refresh token for a new access token."""
+async def refresh_access_token(
+    client_id: str,
+    client_secret: Optional[str],
+    refresh_token: str,
+    redirect_uri: Optional[str] = None,
+) -> dict:
+    """Exchange a refresh token for a new access token.
+
+    Supports both PKCE (secretless) refresh and legacy refresh with client_secret.
+    """
+    body: dict[str, Any] = {
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri or "urn:ietf:wg:oauth:2.0:oob",
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        body["client_secret"] = client_secret
+
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         resp = await client.post(
             f"{TRAKT_BASE}/oauth/token",
-            json={
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-                "grant_type": "refresh_token",
-            },
+            json=body,
             headers={"Content-Type": "application/json"},
         )
         resp.raise_for_status()
         return resp.json()
 
 
-async def revoke_token(client_id: str, client_secret: str, access_token: str) -> None:
+async def revoke_token(client_id: str, client_secret: Optional[str], access_token: str) -> None:
     """Revoke an access token (disconnect)."""
     try:
+        body: dict[str, Any] = {
+            "token": access_token,
+            "client_id": client_id,
+        }
+        if client_secret:
+            body["client_secret"] = client_secret
+
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             await client.post(
                 f"{TRAKT_BASE}/oauth/revoke",
-                json={
-                    "token": access_token,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                },
+                json=body,
                 headers={"Content-Type": "application/json"},
             )
     except Exception as exc:

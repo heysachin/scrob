@@ -78,7 +78,14 @@ async function handle({ params, request }: Parameters<APIRoute>[0]): Promise<Res
     if (location) {
       let allowed = false;
       try {
-        allowed = ALLOWED_REDIRECT_HOSTS.has(new URL(location).hostname);
+        if (location.startsWith("/") && !location.startsWith("//")) {
+          // Safe relative redirect within Scrob (e.g. /connections?trakt=success)
+          allowed = true;
+        } else {
+          const locUrl = new URL(location);
+          const reqUrl = new URL(request.url);
+          allowed = locUrl.hostname === reqUrl.hostname || ALLOWED_REDIRECT_HOSTS.has(locUrl.hostname);
+        }
       } catch {
         // Relative or otherwise unparseable Location - not one of ours, reject below.
       }

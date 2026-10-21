@@ -42,6 +42,7 @@ class User(Base):
     lists             : Mapped[list["List"]]             = relationship(back_populates="user", cascade="all, delete-orphan")
     totp_backup_codes : Mapped[list["TotpBackupCode"]]   = relationship(back_populates="user", cascade="all, delete-orphan")
     oidc_identities   : Mapped[list["OidcIdentity"]]     = relationship(back_populates="user", cascade="all, delete-orphan")
+    trakt_oauth_transactions : Mapped[list["TraktOAuthTransaction"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class UserSettings(Base):

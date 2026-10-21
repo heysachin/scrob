@@ -1361,6 +1361,8 @@ export const api = {
   },
 
   trakt: {
+    pkceStart: (body: { client_id?: string }, token: string) =>
+      post<{ authorization_url: string; expires_in: number }>("/trakt/auth/pkce/start", body, token),
     deviceStart: (token: string) =>
       post<{ user_code: string; verification_url: string; expires_in: number; interval: number }>("/trakt/auth/device/start", undefined, token),
     devicePoll: (token: string) =>

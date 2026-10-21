@@ -32,6 +32,7 @@ from .plex_pending_push import PlexPendingPush
 from .connection_push_state import ConnectionPushState
 from .oauth_device import OAuthDeviceGrant
 from .oidc_identity import OidcIdentity
+from .trakt_oauth import TraktOAuthTransaction
 
 __all__ = [
     "Base",
@@ -66,4 +67,5 @@ __all__ = [
     "ConnectionPushState",
     "OAuthDeviceGrant",
     "OidcIdentity",
+    "TraktOAuthTransaction",
 ]

@@ -643,9 +643,12 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 <div class="flex items-center gap-2">
                   <div class="flex gap-2" onclick="event.stopPropagation()">
                     {settings.trakt_connected ? (
-                      <button type="button" id="trakt-disconnect-btn" class="js-action-btn text-sm bg-zinc-800 hover:bg-red-900/30 text-red-400 border border-zinc-700 hover:border-red-700 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Disconnect</button>
+                      <>
+                        <button type="button" id="trakt-reconnect-btn" class="text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Reconnect</button>
+                        <button type="button" id="trakt-disconnect-btn" class="js-action-btn text-sm bg-zinc-800 hover:bg-red-900/30 text-red-400 border border-zinc-700 hover:border-red-700 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Disconnect</button>
+                      </>
                     ) : (
-                      <button type="button" id="trakt-connect-btn" class="text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Connect Trakt</button>
+                      <button type="button" id="trakt-connect-btn" class="text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Connect with Trakt</button>
                     )}
                   </div>
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="collapsible-chevron w-4 h-4 text-zinc-500 transition-transform pointer-events-none ml-1 shrink-0">
@@ -673,45 +676,73 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 <div class="grid md:grid-cols-2 gap-8 px-6 py-6">
                   <!-- Left: Auth / Info -->
                   <div class="space-y-4">
-                    <p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Requires Trakt VIP</p>
+                    <div class="flex items-center justify-between">
+                      <p class="text-xs font-semibold uppercase tracking-wide text-zinc-400">Trakt API Credentials</p>
+                      <p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Requires Trakt VIP</p>
+                    </div>
                     <div class="space-y-2">
-                      <label for="trakt_client_id" class="block text-sm font-medium text-zinc-400">Client ID</label>
+                      <div class="flex items-center justify-between">
+                        <label for="trakt_client_id" class="block text-sm font-medium text-zinc-300">Client ID <span class="text-red-400 font-semibold">*</span></label>
+                        <span class="text-xs text-zinc-500 font-medium">Required for PKCE</span>
+                      </div>
                       <input
                         type="text"
                         name="trakt_client_id"
                         id="trakt_client_id"
                         value={settings.trakt_client_id || ""}
                         placeholder="Your Trakt application Client ID"
-                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-red-500/50 transition-all font-mono text-sm"
                       />
                     </div>
                     <div class="space-y-2">
-                      <label for="trakt_client_secret" class="block text-sm font-medium text-zinc-400">Client Secret</label>
+                      <div class="flex items-center justify-between">
+                        <label for="trakt_client_secret" class="block text-sm font-medium text-zinc-400">Client Secret</label>
+                        <span class="text-xs text-zinc-500 font-normal">Optional (legacy only)</span>
+                      </div>
                       <div class="relative group/field">
                         <input
                           type="password"
                           name="trakt_client_secret"
                           id="trakt_client_secret"
                           value={settings.trakt_client_secret || ""}
-                          placeholder="Your Trakt application Client Secret"
-                          class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-4 pr-10 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                          placeholder="Optional — leave empty to connect with PKCE"
+                          class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-4 pr-10 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-red-500/50 transition-all font-mono text-sm"
                         />
                         <button type="button" class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 p-1 cursor-pointer transition-colors" aria-label="Toggle password visibility">
                           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 eye-icon"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.644C3.412 7.943 7.213 5 12 5c4.787 0 8.588 2.943 9.964 6.678.066.18.066.362 0 .544C20.588 16.057 16.787 19 12 19c-4.787 0-8.588-2.943-9.964-6.678z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
                           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 eye-slash-icon hidden"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>
                         </button>
                       </div>
-                      <p class="text-xs text-zinc-500">Create a Trakt application at <span class="text-zinc-400">trakt.tv/oauth/applications</span> to get these credentials.</p>
+                      <p class="text-xs text-zinc-500">Create a Trakt application at <span class="text-zinc-400">trakt.tv/oauth/applications</span> with redirect URI <code class="text-zinc-300 bg-zinc-950 px-1 py-0.5 rounded border border-zinc-800">/api/proxy/trakt/auth/pkce/callback</code>.</p>
                     </div>
+
+                    <div class="flex flex-wrap items-center gap-3 pt-1">
+                      <button
+                        type="button"
+                        id="trakt-body-connect-btn"
+                        class="text-sm bg-red-500 hover:bg-red-600 text-white font-medium px-4 py-2 rounded-lg transition-colors cursor-pointer"
+                      >
+                        {settings.trakt_connected ? "Reconnect with Trakt" : "Connect with Trakt"}
+                      </button>
+                      <button
+                        type="button"
+                        id="trakt-device-code-toggle"
+                        class="text-xs text-zinc-400 hover:text-zinc-200 underline cursor-pointer"
+                      >
+                        Legacy device code flow
+                      </button>
+                    </div>
+
                     <div id="trakt-auth-panel" class="hidden space-y-3 bg-zinc-900/50 border border-zinc-700 rounded-xl p-4">
                       <p class="text-sm text-zinc-400">Go to <a id="trakt-verify-url" href="https://trakt.tv/activate" target="_blank" rel="noopener noreferrer" class="font-semibold text-teal-400 hover:text-teal-300 underline break-all"></a> and enter this code:</p>
                       <div class="font-mono text-2xl font-bold tracking-widest text-zinc-100 bg-zinc-950 border border-zinc-700 rounded-lg px-4 py-3 text-center select-all" id="trakt-user-code"></div>
                       <p class="text-xs text-zinc-500" id="trakt-auth-status">Waiting for authorization…</p>
                     </div>
-                    <p class="text-sm text-zinc-400">
+
+                    <p class="text-sm text-zinc-400" id="trakt-info-text">
                       {settings.trakt_connected
                         ? "Trakt is connected. Use Pull to import your watched history and ratings."
-                        : "Enter your Client ID and Secret, then click Connect Trakt."}
+                        : "Enter your Client ID, then click Connect with Trakt (no Client Secret needed)."}
                     </p>
                   </div>
                   <!-- Right: Sync Preferences (only if connected) -->
@@ -4058,32 +4089,127 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       });
     });
 
-    // Trakt Device Auth
+    // Trakt Authentication (OAuth 2.0 PKCE + Device Code fallback)
     function setupTraktAuth() {
+      // 1. Check for incoming OAuth redirect callback indicators in URL
+      const urlParams = new URLSearchParams(window.location.search);
+      const traktParam = urlParams.get('trakt');
+      if (traktParam) {
+        if (traktParam === 'success') {
+          showMessage('Successfully connected to Trakt!', 'success');
+        } else if (traktParam === 'denied') {
+          showMessage('Trakt access authorization was denied.', 'error');
+        } else if (traktParam === 'error') {
+          const msg = urlParams.get('message');
+          let text = 'Failed to connect Trakt. Please try again.';
+          if (msg === 'invalid_or_expired_state') text = 'Authorization session expired or was invalid. Please try again.';
+          else if (msg === 'state_already_used') text = 'Authorization session was already used. Please try again.';
+          else if (msg === 'token_exchange_failed') text = 'Failed to exchange authorization code with Trakt.';
+          else if (msg === 'missing_parameters') text = 'Missing authorization parameters from Trakt.';
+          showMessage(text, 'error');
+        }
+        // Clean URL parameters without reloading
+        const cleanUrl = new URL(window.location.href);
+        cleanUrl.searchParams.delete('trakt');
+        cleanUrl.searchParams.delete('message');
+        window.history.replaceState({}, document.title, cleanUrl.pathname + (cleanUrl.searchParams.toString() ? '?' + cleanUrl.searchParams.toString() : ''));
+      }
+
       const connectBtn = document.getElementById('trakt-connect-btn');
+      const reconnectBtn = document.getElementById('trakt-reconnect-btn');
+      const bodyConnectBtn = document.getElementById('trakt-body-connect-btn');
       const disconnectBtn = document.getElementById('trakt-disconnect-btn');
+      const deviceCodeToggle = document.getElementById('trakt-device-code-toggle');
+
+      // PKCE OAuth start flow
+      const startPkceFlow = async (btn: HTMLElement | null) => {
+        const clientIdInput = document.getElementById('trakt_client_id') as HTMLInputElement | null;
+        const clientSecretInput = document.getElementById('trakt_client_secret') as HTMLInputElement | null;
+        const clientId = clientIdInput?.value.trim() || '';
+        const clientSecret = clientSecretInput?.value.trim() || '';
+
+        if (!clientId) {
+          showMessage('Trakt Client ID is required to connect.', 'error');
+          clientIdInput?.focus();
+          return;
+        }
+
+        const originalText = btn?.textContent || '';
+        if (btn) {
+          (btn as HTMLButtonElement).disabled = true;
+          btn.textContent = 'Redirecting to Trakt…';
+        }
+
+        try {
+          // Persist credentials first so user doesn't lose them
+          const saveRes = await fetch('/api/proxy/auth/settings', {
+            method: 'PATCH',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ trakt_client_id: clientId, trakt_client_secret: clientSecret }),
+          });
+          if (!saveRes.ok) {
+            const err = await saveRes.json();
+            throw new Error(err.detail || 'Failed to save Trakt credentials');
+          }
+
+          const res = await fetch('/api/proxy/trakt/auth/pkce/start', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ client_id: clientId }),
+          });
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || 'Failed to initiate Trakt authorization');
+          }
+
+          const data = await res.json();
+          if (!data.authorization_url) {
+            throw new Error('No authorization URL returned by server');
+          }
+
+          // Redirect browser to Trakt OAuth authorization page
+          window.location.href = data.authorization_url;
+        } catch (e: any) {
+          showMessage(e.message, 'error');
+          if (btn) {
+            (btn as HTMLButtonElement).disabled = false;
+            btn.textContent = originalText;
+          }
+        }
+      };
 
       if (connectBtn) {
-        connectBtn.onclick = async () => {
-          connectBtn.disabled = true;
-          connectBtn.textContent = 'Starting…';
+        connectBtn.onclick = () => startPkceFlow(connectBtn);
+      }
+      if (reconnectBtn) {
+        reconnectBtn.onclick = () => startPkceFlow(reconnectBtn);
+      }
+      if (bodyConnectBtn) {
+        bodyConnectBtn.onclick = () => startPkceFlow(bodyConnectBtn);
+      }
+
+      // Legacy device code flow
+      if (deviceCodeToggle) {
+        deviceCodeToggle.onclick = async () => {
+          const clientIdInput = document.getElementById('trakt_client_id') as HTMLInputElement | null;
+          const clientSecretInput = document.getElementById('trakt_client_secret') as HTMLInputElement | null;
+          const clientId = clientIdInput?.value.trim() || '';
+          const clientSecret = clientSecretInput?.value.trim() || '';
+
+          if (!clientId || !clientSecret) {
+            showMessage('Both Trakt Client ID and Client Secret are required for legacy device code flow.', 'error');
+            if (!clientId) clientIdInput?.focus();
+            else clientSecretInput?.focus();
+            return;
+          }
+
+          deviceCodeToggle.textContent = 'Starting device code flow…';
           try {
-            // If credentials aren't saved yet, save them from the input fields first
-            const clientIdInput = document.getElementById('trakt_client_id') as HTMLInputElement | null;
-            const clientSecretInput = document.getElementById('trakt_client_secret') as HTMLInputElement | null;
-            const clientId = clientIdInput?.value.trim() || '';
-            const clientSecret = clientSecretInput?.value.trim() || '';
-            if (clientId && clientSecret) {
-              const saveRes = await fetch('/api/proxy/auth/settings', {
-                method: 'PATCH',
-                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ trakt_client_id: clientId, trakt_client_secret: clientSecret }),
-              });
-              if (!saveRes.ok) {
-                const err = await saveRes.json();
-                throw new Error(err.detail || 'Failed to save Trakt credentials');
-              }
-            }
+            await fetch('/api/proxy/auth/settings', {
+              method: 'PATCH',
+              headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ trakt_client_id: clientId, trakt_client_secret: clientSecret }),
+            });
 
             const res = await fetch('/api/proxy/trakt/auth/device/start', {
               method: 'POST',
@@ -4091,7 +4217,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             });
             if (!res.ok) {
               const err = await res.json();
-              throw new Error(err.detail || 'Failed to start Trakt auth');
+              throw new Error(err.detail || 'Failed to start Trakt device auth');
             }
             const data = await res.json();
 
@@ -4102,21 +4228,18 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             if (panel) panel.classList.remove('hidden');
             if (urlEl) {
               urlEl.textContent = data.verification_url;
-              // Only link a real http(s) URL; the field is plain text otherwise
               if (/^https?:\/\//i.test(data.verification_url)) urlEl.setAttribute('href', data.verification_url);
               else urlEl.removeAttribute('href');
             }
             if (codeEl) codeEl.textContent = data.user_code;
-            connectBtn.textContent = 'Waiting…';
+            deviceCodeToggle.textContent = 'Waiting for authorization…';
 
-            // Poll for token
             const interval = (data.interval || 5) * 1000;
             const deadline = Date.now() + data.expires_in * 1000;
             const poll = async () => {
               if (Date.now() > deadline) {
                 if (statusEl) statusEl.textContent = 'Authorization timed out. Please try again.';
-                connectBtn.disabled = false;
-                connectBtn.textContent = 'Connect Trakt';
+                deviceCodeToggle.textContent = 'Legacy device code flow';
                 return;
               }
               try {
@@ -4134,18 +4257,16 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 } else {
                   const err = await pollRes.json();
                   if (statusEl) statusEl.textContent = `Error: ${err.detail || 'Authorization failed'}`;
-                  connectBtn.disabled = false;
-                  connectBtn.textContent = 'Connect Trakt';
+                  deviceCodeToggle.textContent = 'Legacy device code flow';
                   return;
                 }
               } catch (e) {}
               setTimeout(poll, interval);
             };
             setTimeout(poll, interval);
-          } catch (e) {
+          } catch (e: any) {
             showMessage(e.message, 'error');
-            connectBtn.disabled = false;
-            connectBtn.textContent = 'Connect Trakt';
+            deviceCodeToggle.textContent = 'Legacy device code flow';
           }
         };
       }

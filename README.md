@@ -645,6 +645,8 @@ FROM_EMAIL: "myemail@gmail.com"
 |---|---|---|
 | `REQUIRE_EMAIL_VALIDATION` | `false` | Require new users to verify their email before logging in. |
 | `SERVER_URL` | - | Public URL of your Scrob instance, used to build the validation link in emails. |
+| `SCROB_PUBLIC_URL` | - | Public URL of your Scrob instance (e.g. `https://scrob.sachindev.com`), used for OAuth redirects (Trakt PKCE). |
+| `TRAKT_REDIRECT_URL` | - | Explicit redirect URI override for Trakt OAuth PKCE (defaults to `{SCROB_PUBLIC_URL}/api/proxy/trakt/auth/pkce/callback`). |
 | `SMTP_ADDRESS` | - | SMTP server hostname. |
 | `SMTP_PORT` | `587` | SMTP server port. |
 | `SMTP_ENCRYPTION` | `tls` | Encryption method - `tls` or `ssl`. |
