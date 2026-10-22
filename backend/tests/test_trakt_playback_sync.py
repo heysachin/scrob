@@ -152,7 +152,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
             s.add(job)
             await s.commit()
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 stats, _, _, _, _ = await trakt_router._apply_trakt_import(
                     s,
                     job_id=201,
@@ -231,8 +231,8 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
             await s.commit()
 
             with (
-                patch.object(trakt_router, "_get_or_create_show", AsyncMock(return_value=show)),
-                patch.object(trakt_router, "_get_or_create_episode_media", AsyncMock(return_value=ep_media)),
+                patch.object(trakt_router, "_get_or_create_show", autospec=True, return_value=show),
+                patch.object(trakt_router, "_get_or_create_episode_media", autospec=True, return_value=ep_media),
             ):
                 stats, _, _, _, _ = await trakt_router._apply_trakt_import(
                     s,
@@ -280,7 +280,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
             s.add(job1)
             await s.commit()
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 await trakt_router._apply_trakt_import(
                     s, job_id=203, user_id=1, source=make_source(30.0), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
@@ -293,7 +293,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
             s.add(job2)
             await s.commit()
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 await trakt_router._apply_trakt_import(
                     s, job_id=204, user_id=1, source=make_source(55.0), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
@@ -336,7 +336,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
                         "movie": {"title": "Movie 4", "ids": {"tmdb": 700}},
                     }]
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 stats, _, _, _, _ = await trakt_router._apply_trakt_import(
                     s, job_id=205, user_id=1, source=OlderTraktSource(), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
@@ -382,7 +382,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
                         "movie": {"title": "Movie 5", "ids": {"tmdb": 800}},
                     }]
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 stats, _, _, _, _ = await trakt_router._apply_trakt_import(
                     s, job_id=206, user_id=1, source=NewerTraktSource(), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
@@ -427,7 +427,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
                         "movie": {"title": "Completed Movie", "ids": {"tmdb": 900}},
                     }]
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 stats, _, _, _, _ = await trakt_router._apply_trakt_import(
                     s, job_id=207, user_id=1, source=StaleTraktSource(), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
@@ -468,7 +468,7 @@ class TraktPlaybackSyncTests(unittest.IsolatedAsyncioTestCase):
                         "movie": {"title": "Newly Finished Movie", "ids": {"tmdb": 1001}},
                     }]
 
-            with patch.object(trakt_router, "_get_or_create_movie_media", AsyncMock(return_value=movie_media)):
+            with patch.object(trakt_router, "_get_or_create_movie_media", autospec=True, return_value=movie_media):
                 stats, _, _, new_watched, _ = await trakt_router._apply_trakt_import(
                     s, job_id=208, user_id=1, source=FinishedSource(), api_key="k",
                     sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,

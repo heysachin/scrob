@@ -1297,7 +1297,7 @@ async def _apply_trakt_import(
                         stats["errors"] += 1
                         continue
                     media = await _get_or_create_episode_media(
-                        db, show.id, show_tmdb_id, season_num, ep_num, api_key, cache=season_cache
+                        db, show.id, show_tmdb_id, season_num, ep_num, api_key, season_cache=season_cache
                     )
                     if not media:
                         stats["errors"] += 1
