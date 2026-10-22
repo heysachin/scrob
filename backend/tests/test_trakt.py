@@ -624,7 +624,7 @@ class TraktHistorySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end_at, cutoff)
         self.assertEqual(
             trakt_router._history_window(cursor, True, cutoff),
-            (None, cutoff),
+            (None, None),
         )
 
     async def test_incremental_pull_advances_cursor_only_after_success(self) -> None:

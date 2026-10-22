@@ -25,6 +25,7 @@ from core.limiter import limiter
 from core.timeutil import utcnow
 from db import get_db
 from dependencies import get_current_user
+from models.sync import SyncJob
 from models.trakt_oauth import TraktOAuthTransaction
 from models.users import User, UserSettings
 from routers import trakt as trakt_router
@@ -465,6 +466,8 @@ class TraktPkceRefreshTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as conn:
             await conn.run_sync(User.__table__.create)
             await conn.run_sync(UserSettings.__table__.create)
+            await conn.run_sync(TraktOAuthTransaction.__table__.create)
+            await conn.run_sync(SyncJob.__table__.create)
 
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
 
@@ -589,6 +592,9 @@ class TraktPkceRefreshTests(unittest.IsolatedAsyncioTestCase):
             us = (await s.execute(select(UserSettings).where(UserSettings.user_id == 1))).scalar_one()
             self.assertIsNone(us.trakt_access_token)
             self.assertIsNone(us.trakt_refresh_token)
+            self.assertIsNone(us.trakt_client_id)
+            self.assertIsNone(us.trakt_client_secret)
+            self.assertIsNone(us.trakt_history_cursor_at)
 
     def test_require_trakt_config_allows_pkce_without_secret(self):
         settings = UserSettings(user_id=1, trakt_client_id="cid", trakt_client_secret=None)
