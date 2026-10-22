@@ -59,6 +59,10 @@ class TraktDiagnosticReport:
     episodes_discrepancy_count: int = 0
     unrestricted_recent_movies_excluded_by_mode_a: list[dict] = field(default_factory=list)
     unrestricted_recent_episodes_excluded_by_mode_a: list[dict] = field(default_factory=list)
+    playback_movies_count: int = 0
+    playback_episodes_count: int = 0
+    playback_target_match_found: bool = False
+    playback_target_match_details: Optional[dict] = None
     local_db_status: dict = field(default_factory=dict)
     summary: str = ""
 
@@ -269,6 +273,51 @@ async def run_trakt_diagnostics(
             target_watched_at=target_watched_at,
         )
         report.mode_b_unrestricted_episodes = diag_b_episodes
+
+        # In-progress playback (continue watching) check
+        try:
+            pb_movies = await trakt_client.get_playback_movies(client_id, access_token)
+        except Exception:
+            pb_movies = []
+        try:
+            pb_episodes = await trakt_client.get_playback_episodes(client_id, access_token)
+        except Exception:
+            pb_episodes = []
+
+        report.playback_movies_count = len(pb_movies)
+        report.playback_episodes_count = len(pb_episodes)
+
+        if target_title or target_tmdb_id:
+            for item in pb_movies:
+                m = item.get("movie") or {}
+                if (target_tmdb_id and m.get("ids", {}).get("tmdb") == target_tmdb_id) or (
+                    target_title and target_title.lower() in (m.get("title") or "").lower()
+                ):
+                    report.playback_target_match_found = True
+                    report.playback_target_match_details = {
+                        "type": "movie",
+                        "title": m.get("title"),
+                        "tmdb_id": m.get("ids", {}).get("tmdb"),
+                        "progress": item.get("progress"),
+                        "paused_at": item.get("paused_at"),
+                    }
+                    break
+            if not report.playback_target_match_found:
+                for item in pb_episodes:
+                    s = item.get("show") or {}
+                    ep = item.get("episode") or {}
+                    if (target_tmdb_id and (s.get("ids", {}).get("tmdb") == target_tmdb_id or ep.get("ids", {}).get("tmdb") == target_tmdb_id)) or (
+                        target_title and target_title.lower() in (s.get("title") or "").lower()
+                    ):
+                        report.playback_target_match_found = True
+                        report.playback_target_match_details = {
+                            "type": "episode",
+                            "show_title": s.get("title"),
+                            "episode": f"S{ep.get('season')}E{ep.get('number')}",
+                            "progress": item.get("progress"),
+                            "paused_at": item.get("paused_at"),
+                        }
+                        break
 
     # 4. Compare discrepancies
     ids_a_movies = {item["id"] for item in items_a_movies if "id" in item}

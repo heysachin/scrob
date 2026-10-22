@@ -37,6 +37,7 @@ from models.comments import Comment
 from models.events import WatchEvent
 from models.lists import List as ListModel, ListItem
 from models.media import Media
+from models.playback_progress import PlaybackProgress
 from models.ratings import Rating, RatingChanges
 from models.show import Show
 from models.sync import SyncJob, SyncStatus
@@ -825,6 +826,12 @@ class LiveTraktSource:
     async def get_list_items(self, list_slug: str):
         return await trakt_client.get_list_items(self.client_id, self.access_token, list_slug)
 
+    async def get_playback_movies(self):
+        return await trakt_client.get_playback_movies(self.client_id, self.access_token)
+
+    async def get_playback_episodes(self):
+        return await trakt_client.get_playback_episodes(self.client_id, self.access_token)
+
 
 class ExportTraktSource:
     """Serves watched history, ratings, and lists from a parsed Trakt data export.
@@ -855,6 +862,12 @@ class ExportTraktSource:
 
     async def get_comments(self):
         return self.data.comments
+
+    async def get_playback_movies(self):
+        return []
+
+    async def get_playback_episodes(self):
+        return []
 
 
 _UNIMPORTED_CAP = 200
@@ -911,6 +924,12 @@ async def _apply_trakt_import(
         "skipped_duplicates_episodes": 0,
         "skipped_missing_tmdb": 0,
         "skipped_invalid_data": 0,
+        "playback_movies": 0,
+        "playback_episodes": 0,
+        "fetched_playback_movies": 0,
+        "fetched_playback_episodes": 0,
+        "skipped_playback_stale": 0,
+        "removed_playback": 0,
     }
     _new_watched: set[int] = set()
     _new_ratings: RatingChanges = {}
@@ -1113,6 +1132,240 @@ async def _apply_trakt_import(
                 await _raise_if_cancelled(db, job_id)
         await db.commit()
         history_had_errors = stats["errors"] > history_error_count
+
+        # Clear local PlaybackProgress for any items newly imported as completed watches
+        if _new_watched:
+            await db.execute(
+                delete(PlaybackProgress).where(
+                    PlaybackProgress.user_id == user_id,
+                    PlaybackProgress.media_id.in_(_new_watched),
+                )
+            )
+            await db.commit()
+
+        # ── Continue Watching (Playback Progress) ─────────────────────
+        print("  Fetching continue watching playback progress from Trakt...")
+        await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(current_step="Pulling playback progress"))
+        await db.commit()
+
+        playback_fetch_ok = True
+        try:
+            playback_movies = await source.get_playback_movies()
+        except Exception as exc:
+            logger.warning("Failed to fetch Trakt movie playback progress: %s", exc)
+            playback_movies = []
+            playback_fetch_ok = False
+            stats["errors"] += 1
+
+        try:
+            playback_episodes = await source.get_playback_episodes()
+        except Exception as exc:
+            logger.warning("Failed to fetch Trakt episode playback progress: %s", exc)
+            playback_episodes = []
+            playback_fetch_ok = False
+            stats["errors"] += 1
+
+        stats["fetched_playback_movies"] = len(playback_movies)
+        stats["fetched_playback_episodes"] = len(playback_episodes)
+        if playback_movies or playback_episodes:
+            print(f"  {len(playback_movies)} movie and {len(playback_episodes)} episode in-progress plays fetched from Trakt")
+
+        seen_trakt_playback_ids: set[int] = set()
+
+        for entry in playback_movies:
+            pb_id = entry.get("id")
+            if pb_id:
+                seen_trakt_playback_ids.add(pb_id)
+
+            movie_data = entry.get("movie") or {}
+            tmdb_id = movie_data.get("ids", {}).get("tmdb")
+            if not tmdb_id:
+                stats["skipped"] += 1
+                stats["skipped_missing_tmdb"] += 1
+                _note_unimported(stats, f'playback movie "{movie_data.get("title", "?")}"', "no TMDB id")
+                continue
+
+            progress_raw = entry.get("progress")
+            try:
+                progress_val = float(progress_raw) if progress_raw is not None else 0.0
+            except (TypeError, ValueError):
+                stats["skipped"] += 1
+                stats["skipped_invalid_data"] += 1
+                continue
+
+            progress_percent = round(min(1.0, max(0.0, progress_val / 100.0)), 4)
+            if progress_percent < 0.01 or progress_percent >= 0.95:
+                stats["skipped"] += 1
+                continue
+
+            paused_at = _parse_trakt_datetime(entry.get("paused_at")) or utcnow()
+
+            try:
+                async with db.begin_nested():
+                    media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
+                    if not media:
+                        stats["errors"] += 1
+                        continue
+
+                    # If this movie has already been completed at or after paused_at, progress is stale
+                    latest_watch_times = existing_times.get(media.id) or []
+                    if any(wt >= paused_at for wt in latest_watch_times):
+                        stats["skipped"] += 1
+                        stats["skipped_playback_stale"] += 1
+                        continue
+
+                    existing_pp = (
+                        await db.execute(
+                            select(PlaybackProgress).where(
+                                PlaybackProgress.user_id == user_id,
+                                PlaybackProgress.media_id == media.id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+
+                    runtime_mins = getattr(media, "runtime", None) or 0
+                    progress_seconds = int(progress_percent * runtime_mins * 60) if runtime_mins > 0 else 0
+
+                    if existing_pp:
+                        # Conflict handling: do not overwrite newer local progress with older Trakt data
+                        if existing_pp.updated_at and existing_pp.updated_at > paused_at:
+                            stats["skipped"] += 1
+                            stats["skipped_playback_stale"] += 1
+                            continue
+                        existing_pp.progress_percent = progress_percent
+                        existing_pp.progress_seconds = progress_seconds
+                        existing_pp.updated_at = paused_at
+                        existing_pp.trakt_playback_id = pb_id
+                        stats["playback_movies"] += 1
+                    else:
+                        db.add(
+                            PlaybackProgress(
+                                user_id=user_id,
+                                media_id=media.id,
+                                progress_percent=progress_percent,
+                                progress_seconds=progress_seconds,
+                                updated_at=paused_at,
+                                trakt_playback_id=pb_id,
+                            )
+                        )
+                        stats["playback_movies"] += 1
+            except Exception as exc:
+                logger.warning("Error processing Trakt movie playback progress for tmdb=%s: %s", tmdb_id, exc)
+                stats["errors"] += 1
+
+        for entry in playback_episodes:
+            pb_id = entry.get("id")
+            if pb_id:
+                seen_trakt_playback_ids.add(pb_id)
+
+            show_data = entry.get("show") or {}
+            show_tmdb_id = show_data.get("ids", {}).get("tmdb")
+            if not show_tmdb_id:
+                stats["skipped"] += 1
+                stats["skipped_missing_tmdb"] += 1
+                _note_unimported(stats, f'playback show "{show_data.get("title", "?")}"', "no TMDB id")
+                continue
+
+            ep_data = entry.get("episode") or {}
+            season_num = ep_data.get("season")
+            ep_num = ep_data.get("number")
+            if season_num is None or ep_num is None:
+                stats["skipped"] += 1
+                stats["skipped_invalid_data"] += 1
+                _note_unimported(stats, f'playback episode for "{show_data.get("title", "?")}"', "no season/episode number")
+                continue
+
+            progress_raw = entry.get("progress")
+            try:
+                progress_val = float(progress_raw) if progress_raw is not None else 0.0
+            except (TypeError, ValueError):
+                stats["skipped"] += 1
+                stats["skipped_invalid_data"] += 1
+                continue
+
+            progress_percent = round(min(1.0, max(0.0, progress_val / 100.0)), 4)
+            if progress_percent < 0.01 or progress_percent >= 0.95:
+                stats["skipped"] += 1
+                continue
+
+            paused_at = _parse_trakt_datetime(entry.get("paused_at")) or utcnow()
+
+            try:
+                async with db.begin_nested():
+                    show = await _get_or_create_show(db, show_tmdb_id, show_data.get("title", ""), api_key)
+                    if not show:
+                        stats["errors"] += 1
+                        continue
+                    media = await _get_or_create_episode_media(
+                        db, show.id, show_tmdb_id, season_num, ep_num, api_key, cache=season_cache
+                    )
+                    if not media:
+                        stats["errors"] += 1
+                        continue
+
+                    latest_watch_times = existing_times.get(media.id) or []
+                    if any(wt >= paused_at for wt in latest_watch_times):
+                        stats["skipped"] += 1
+                        stats["skipped_playback_stale"] += 1
+                        continue
+
+                    existing_pp = (
+                        await db.execute(
+                            select(PlaybackProgress).where(
+                                PlaybackProgress.user_id == user_id,
+                                PlaybackProgress.media_id == media.id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+
+                    runtime_mins = getattr(media, "runtime", None) or 0
+                    progress_seconds = int(progress_percent * runtime_mins * 60) if runtime_mins > 0 else 0
+
+                    if existing_pp:
+                        if existing_pp.updated_at and existing_pp.updated_at > paused_at:
+                            stats["skipped"] += 1
+                            stats["skipped_playback_stale"] += 1
+                            continue
+                        existing_pp.progress_percent = progress_percent
+                        existing_pp.progress_seconds = progress_seconds
+                        existing_pp.updated_at = paused_at
+                        existing_pp.trakt_playback_id = pb_id
+                        stats["playback_episodes"] += 1
+                    else:
+                        db.add(
+                            PlaybackProgress(
+                                user_id=user_id,
+                                media_id=media.id,
+                                progress_percent=progress_percent,
+                                progress_seconds=progress_seconds,
+                                updated_at=paused_at,
+                                trakt_playback_id=pb_id,
+                            )
+                        )
+                        stats["playback_episodes"] += 1
+            except Exception as exc:
+                logger.warning("Error processing Trakt episode playback progress s%se%s for tmdb=%s: %s", season_num, ep_num, show_tmdb_id, exc)
+                stats["errors"] += 1
+
+        # Clean up removed Trakt playback entries:
+        # If a PlaybackProgress for this user was previously synced from Trakt (has trakt_playback_id),
+        # but is no longer present in Trakt's playback response, safely delete it.
+        if playback_fetch_ok:
+            all_trakt_pps = (
+                await db.execute(
+                    select(PlaybackProgress).where(
+                        PlaybackProgress.user_id == user_id,
+                        PlaybackProgress.trakt_playback_id.is_not(None),
+                    )
+                )
+            ).scalars().all()
+
+            for pp in all_trakt_pps:
+                if pp.trakt_playback_id not in seen_trakt_playback_ids:
+                    await db.delete(pp)
+                    stats["removed_playback"] = stats.get("removed_playback", 0) + 1
+
+        await db.commit()
 
     await _raise_if_cancelled(db, job_id)
 
@@ -1494,10 +1747,17 @@ def _trakt_import_summary(job_id: int, label: str, stats: dict) -> str:
 
     movie_skip = stats.get("skipped_duplicates_movies", 0)
     ep_skip = stats.get("skipped_duplicates_episodes", 0)
+    playback_parts = []
+    if stats.get("playback_movies"):
+        playback_parts.append(f"{stats['playback_movies']} movies")
+    if stats.get("playback_episodes"):
+        playback_parts.append(f"{stats['playback_episodes']} episodes")
+    playback_str = f"Continue watching: {', '.join(playback_parts)} in progress. " if playback_parts else ""
     return (
         f"Trakt {label} job {job_id} completed. "
         f"Movies: {stats['movies']} new ({movie_skip} skipped). "
         f"Episodes: {stats['episodes']} new ({ep_skip} skipped). "
+        f"{playback_str}"
         f"Total skipped: {stats.get('skipped', 0)}{details_str}. "
         f"Ratings: {stats['ratings']} new. "
         f"Lists: {stats['lists']} new, {stats['list_items']} items added. "

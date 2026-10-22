@@ -252,6 +252,26 @@ async def get_history_episodes(
         )
 
 
+async def get_playback_movies(client_id: str, access_token: str) -> list[dict]:
+    """Fetch in-progress movie playback records (continue watching) from Trakt."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        return await _get_all_pages(
+            client,
+            "/sync/playback/movies",
+            _headers(client_id, access_token),
+        )
+
+
+async def get_playback_episodes(client_id: str, access_token: str) -> list[dict]:
+    """Fetch in-progress episode playback records (continue watching) from Trakt."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        return await _get_all_pages(
+            client,
+            "/sync/playback/episodes",
+            _headers(client_id, access_token),
+        )
+
+
 async def get_ratings(client_id: str, access_token: str) -> dict:
     """Fetch every page of movie, show, season, and episode ratings."""
 

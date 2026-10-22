@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, Index, UniqueConstraint
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -21,6 +21,7 @@ class PlaybackProgress(Base):
     progress_percent : Mapped[float]          = mapped_column(Float, default=0.0, nullable=False)
     progress_seconds : Mapped[int]            = mapped_column(Integer, default=0, nullable=False)
     updated_at       : Mapped[datetime]       = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    trakt_playback_id: Mapped[Optional[int]]  = mapped_column(BigInteger, nullable=True)
 
     user  : Mapped["User"]  = relationship()
     media : Mapped["Media"] = relationship()
