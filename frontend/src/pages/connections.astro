@@ -2353,13 +2353,19 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           const newM = s.movies ?? s.imported_movies ?? 0;
           const newE = s.episodes ?? s.imported_episodes ?? 0;
           const newR = s.ratings ?? 0;
+          const pbM = s.playback_movies ?? 0;
+          const pbE = s.playback_episodes ?? 0;
+          const pbTotal = pbM + pbE;
           const dupes = s.skipped_duplicates ?? 0;
           const missingMeta = (s.skipped_missing_tmdb ?? 0) + (s.skipped_invalid_data ?? 0);
           const errors = s.errors ?? 0;
           const totalSkipped = s.skipped ?? (dupes + missingMeta);
 
           if (newM === 0 && newE === 0 && newR === 0) {
-            if (dupes > 0 || totalSkipped > 0) {
+            if (pbTotal > 0) {
+              const skippedNote = (dupes > 0 || totalSkipped > 0) ? ` (${dupes || totalSkipped} skipped as duplicates)` : '';
+              items.textContent = `${pbTotal} in progress${skippedNote}`;
+            } else if (dupes > 0 || totalSkipped > 0) {
               const metaNote = missingMeta > 0 ? `, ${missingMeta} missing metadata` : '';
               const errNote = errors > 0 ? `, ${errors} errors` : '';
               items.textContent = `0 new (${dupes || totalSkipped} skipped as duplicates${metaNote}${errNote})`;
@@ -2369,9 +2375,10 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               items.textContent = 'Nothing new to import';
             }
           } else {
+            const pbText = pbTotal > 0 ? `, ${pbTotal} in progress` : '';
             const skippedText = totalSkipped > 0 ? ` (${totalSkipped} skipped)` : '';
             const errorText = errors > 0 ? ` (${errors} failed)` : '';
-            items.textContent = `${newM} movies, ${newE} episodes, ${newR} ratings${skippedText}${errorText}`;
+            items.textContent = `${newM} movies, ${newE} episodes, ${newR} ratings${pbText}${skippedText}${errorText}`;
           }
         } else {
           items.textContent = `${job.processed_items} items`;
