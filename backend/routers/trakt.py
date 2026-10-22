@@ -149,9 +149,10 @@ def _history_window(
     cursor: datetime | None,
     full_resync: bool,
     cutoff: datetime,
-) -> tuple[datetime | None, datetime]:
-    start_at = None if full_resync or cursor is None else cursor - TRAKT_HISTORY_OVERLAP
-    return start_at, cutoff
+) -> tuple[datetime | None, datetime | None]:
+    if full_resync or cursor is None:
+        return None, None
+    return cursor - TRAKT_HISTORY_OVERLAP, cutoff
 
 
 def _remote_history_times(
@@ -540,25 +541,50 @@ async def trakt_device_poll(
 
 @router.delete("/auth/disconnect")
 async def trakt_disconnect(
+    clear_credentials: bool = Query(default=True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Revoke the Trakt token and clear stored credentials."""
+    """Revoke the Trakt token and clear stored credentials, tokens, and active jobs."""
     result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
     settings = result.scalar_one_or_none()
 
-    if settings and settings.trakt_access_token:
-        if settings.trakt_client_id:
-            await trakt_client.revoke_token(
-                settings.trakt_client_id,
-                settings.trakt_client_secret,
-                settings.trakt_access_token,
-            )
+    if settings:
+        if settings.trakt_access_token and settings.trakt_client_id:
+            try:
+                await trakt_client.revoke_token(
+                    settings.trakt_client_id,
+                    settings.trakt_client_secret,
+                    settings.trakt_access_token,
+                )
+            except Exception as exc:
+                logger.warning("Remote Trakt token revocation failed: %s", exc)
+
         settings.trakt_access_token = None
         settings.trakt_refresh_token = None
         settings.trakt_token_expires_at = None
         settings.trakt_device_code = None
         settings.trakt_history_cursor_at = None
+        if clear_credentials:
+            settings.trakt_client_id = None
+            settings.trakt_client_secret = None
+
+        # Clean up any pending unconsumed PKCE OAuth transactions for this user
+        await db.execute(
+            delete(TraktOAuthTransaction).where(
+                TraktOAuthTransaction.user_id == current_user.id,
+            )
+        )
+        # Cancel any pending or running Trakt sync jobs so old jobs cannot overwrite new state
+        await db.execute(
+            update(SyncJob)
+            .where(
+                SyncJob.user_id == current_user.id,
+                SyncJob.source == CollectionSource.trakt,
+                SyncJob.status.in_([SyncStatus.pending, SyncStatus.running]),
+            )
+            .values(status=SyncStatus.cancelled)
+        )
         await db.commit()
 
     return {"status": "disconnected"}
@@ -781,10 +807,10 @@ class LiveTraktSource:
         self.client_id = client_id
         self.access_token = access_token
 
-    async def get_history_movies(self, start_at: datetime | None, end_at: datetime):
+    async def get_history_movies(self, start_at: datetime | None = None, end_at: datetime | None = None):
         return await trakt_client.get_history_movies(self.client_id, self.access_token, start_at=start_at, end_at=end_at)
 
-    async def get_history_episodes(self, start_at: datetime | None, end_at: datetime):
+    async def get_history_episodes(self, start_at: datetime | None = None, end_at: datetime | None = None):
         return await trakt_client.get_history_episodes(self.client_id, self.access_token, start_at=start_at, end_at=end_at)
 
     async def get_ratings(self):
@@ -809,10 +835,10 @@ class ExportTraktSource:
     def __init__(self, data: TraktExportData):
         self.data = data
 
-    async def get_history_movies(self, start_at: datetime | None, end_at: datetime):
+    async def get_history_movies(self, start_at: datetime | None = None, end_at: datetime | None = None):
         return self.data.history_movies
 
-    async def get_history_episodes(self, start_at: datetime | None, end_at: datetime):
+    async def get_history_episodes(self, start_at: datetime | None = None, end_at: datetime | None = None):
         return self.data.history_episodes
 
     async def get_ratings(self):
@@ -855,7 +881,7 @@ async def _apply_trakt_import(
     sync_lists: bool,
     split_watchlist: bool,
     history_start: datetime | None,
-    history_end: datetime,
+    history_end: datetime | None,
     window_minutes: int = DEFAULT_DEDUP_WINDOW_MINUTES,
 ) -> tuple[dict, int, bool, set[int], RatingChanges]:
     """Fetches (from `source`) and applies watched history, ratings, and lists.
@@ -868,7 +894,24 @@ async def _apply_trakt_import(
     """
     from routers.sync import SyncCancelled, _raise_if_cancelled
 
-    stats = {"movies": 0, "episodes": 0, "ratings": 0, "lists": 0, "list_items": 0, "skipped": 0, "errors": 0}
+    stats = {
+        "movies": 0,
+        "episodes": 0,
+        "ratings": 0,
+        "lists": 0,
+        "list_items": 0,
+        "skipped": 0,
+        "errors": 0,
+        "fetched_movies": 0,
+        "fetched_episodes": 0,
+        "imported_movies": 0,
+        "imported_episodes": 0,
+        "skipped_duplicates": 0,
+        "skipped_duplicates_movies": 0,
+        "skipped_duplicates_episodes": 0,
+        "skipped_missing_tmdb": 0,
+        "skipped_invalid_data": 0,
+    }
     _new_watched: set[int] = set()
     _new_ratings: RatingChanges = {}
     watched_processed = 0
@@ -901,6 +944,7 @@ async def _apply_trakt_import(
             start_at=history_start,
             end_at=history_end,
         )
+        stats["fetched_movies"] = len(history_movies)
         print(f"  {len(history_movies)} movie plays fetched from Trakt")
         await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(total_items=len(history_movies), current_step="Pulling watched movies"))
         await db.commit()
@@ -917,6 +961,7 @@ async def _apply_trakt_import(
             try:
                 if not tmdb_id:
                     stats["skipped"] += 1
+                    stats["skipped_missing_tmdb"] += 1
                     _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', "no TMDB id")
                     continue
                 try:
@@ -943,8 +988,11 @@ async def _apply_trakt_import(
                             existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                             _new_watched.add(media.id)
                             stats["movies"] += 1
+                            stats["imported_movies"] += 1
                         else:
                             stats["skipped"] += 1
+                            stats["skipped_duplicates"] += 1
+                            stats["skipped_duplicates_movies"] += 1
                 except Exception as exc:
                     logger.warning("Error processing Trakt movie tmdb=%s: %s", tmdb_id, exc)
                     stats["errors"] += 1
@@ -970,6 +1018,7 @@ async def _apply_trakt_import(
             start_at=history_start,
             end_at=history_end,
         )
+        stats["fetched_episodes"] = len(history_episodes)
         print(f"  {len(history_episodes)} episode plays fetched from Trakt")
 
         await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(
@@ -990,6 +1039,7 @@ async def _apply_trakt_import(
                 plays_by_show.setdefault(show_tmdb_id, []).append(entry)
             else:
                 stats["skipped"] += 1
+                stats["skipped_missing_tmdb"] += 1
                 _note_unimported(stats, f'show "{entry.get("show", {}).get("title", "?")}"', "no TMDB id")
 
         async def process_show(show_tmdb_id: int, entries: list[dict]):
@@ -1009,6 +1059,7 @@ async def _apply_trakt_import(
                     ep_num = ep_data.get("number")
                     if season_num is None or ep_num is None:
                         stats["skipped"] += 1
+                        stats["skipped_invalid_data"] += 1
                         _note_unimported(stats, f'show "{show_title}" episode', "no season/episode number")
                         continue
                     try:
@@ -1038,8 +1089,11 @@ async def _apply_trakt_import(
                                 existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                                 _new_watched.add(media.id)
                                 stats["episodes"] += 1
+                                stats["imported_episodes"] += 1
                             else:
                                 stats["skipped"] += 1
+                                stats["skipped_duplicates"] += 1
+                                stats["skipped_duplicates_episodes"] += 1
                     except Exception as exc:
                         logger.warning("Error processing episode s%se%s for show tmdb=%s: %s", season_num, ep_num, show_tmdb_id, exc)
                         stats["errors"] += 1
@@ -1429,10 +1483,22 @@ def _trakt_import_summary(job_id: int, label: str, stats: dict) -> str:
             label, job_id, len(unimported) + more, "; ".join(unimported),
             f" (+{more} more)" if more else "",
         )
+    skipped_details = []
+    if stats.get("skipped_duplicates"):
+        skipped_details.append(f"{stats['skipped_duplicates']} duplicates")
+    if stats.get("skipped_missing_tmdb"):
+        skipped_details.append(f"{stats['skipped_missing_tmdb']} missing TMDB ID")
+    if stats.get("skipped_invalid_data"):
+        skipped_details.append(f"{stats['skipped_invalid_data']} invalid metadata")
+    details_str = f" ({', '.join(skipped_details)})" if skipped_details else ""
+
+    movie_skip = stats.get("skipped_duplicates_movies", 0)
+    ep_skip = stats.get("skipped_duplicates_episodes", 0)
     return (
         f"Trakt {label} job {job_id} completed. "
-        f"Movies: {stats['movies']} new, {stats.get('skipped', 0)} skipped. "
-        f"Episodes: {stats['episodes']} new. "
+        f"Movies: {stats['movies']} new ({movie_skip} skipped). "
+        f"Episodes: {stats['episodes']} new ({ep_skip} skipped). "
+        f"Total skipped: {stats.get('skipped', 0)}{details_str}. "
         f"Ratings: {stats['ratings']} new. "
         f"Lists: {stats['lists']} new, {stats['list_items']} items added. "
         f"Comments: {stats.get('comments', 0)} new. "
@@ -1568,7 +1634,7 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
             )
 
             if settings.trakt_sync_watched and not history_had_errors:
-                settings.trakt_history_cursor_at = history_end
+                settings.trakt_history_cursor_at = history_end or history_cutoff
 
             if settings.trakt_sync_dropped:
                 dropped_items = await trakt_client.get_dropped_shows(client_id, access_token)
@@ -1788,6 +1854,26 @@ async def sync_trakt(
     background_tasks.add_task(run_trakt_sync, current_user.id, job.id, full)
     mode = "full resync" if full else "incremental sync"
     return {"status": "started", "job_id": job.id, "message": f"Trakt {mode} is running in the background"}
+
+
+@router.get("/sync/diagnostics")
+async def trakt_sync_diagnostics(
+    expected_username: str | None = Query(default=None),
+    target_title: str | None = Query(default=None),
+    target_tmdb_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Safe read-only diagnostics comparing current full resync vs unrestricted history fetch."""
+    from core.trakt_diagnostics import run_trakt_diagnostics
+    report = await run_trakt_diagnostics(
+        db,
+        user_id=current_user.id,
+        expected_username=expected_username,
+        target_title=target_title,
+        target_tmdb_id=target_tmdb_id,
+    )
+    return report.to_dict()
 
 
 @router.get("/comments")

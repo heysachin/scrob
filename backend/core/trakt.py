@@ -185,6 +185,29 @@ async def validate_token(client_id: str, access_token: str) -> bool:
         return False
 
 
+async def get_user_profile(client_id: str, access_token: str) -> Optional[dict]:
+    """Fetch user profile metadata (/users/me) for authenticated identity check."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{TRAKT_BASE}/users/me",
+                headers=_headers(client_id, access_token),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "username": data.get("username"),
+                    "name": data.get("name"),
+                    "slug": data.get("ids", {}).get("slug"),
+                    "private": data.get("private"),
+                    "joined_at": data.get("joined_at"),
+                }
+            return None
+    except Exception as exc:
+        logger.warning("Failed to fetch Trakt user profile: %s", exc)
+        return None
+
+
 # ── User Data Fetching ────────────────────────────────────────────────────────
 
 async def get_history_movies(
