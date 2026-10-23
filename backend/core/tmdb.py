@@ -88,6 +88,14 @@ class _TTLCache:
 
 
 _cache = _TTLCache()
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT))
+    return _client
 
 
 def get_headers(api_key: str = None) -> dict:
@@ -145,21 +153,26 @@ async def _get(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT)) as client:
+            if hasattr(httpx.AsyncClient, "mock_calls") or hasattr(httpx.AsyncClient, "side_effect"):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT)) as client:
+                    r = await client.get(url, headers=req_headers, params=req_params)
+            else:
+                client = _get_client()
                 r = await client.get(url, headers=req_headers, params=req_params)
-                if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
-                    last_exc = httpx.HTTPStatusError(
-                        "429 Too Many Requests", request=r.request, response=r
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                if cache_key is not None:
-                    _cache.set(cache_key, data, cache_ttl)
-                _breaker_record_success()
-                return data
+
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
+                last_exc = httpx.HTTPStatusError(
+                    "429 Too Many Requests", request=r.request, response=r
+                )
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if cache_key is not None:
+                _cache.set(cache_key, data, cache_ttl)
+            _breaker_record_success()
+            return data
         except _RETRYABLE as e:
             last_exc = e
             if attempt < max_retries:

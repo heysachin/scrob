@@ -441,7 +441,7 @@ async def get_history(
 
     total_result = await db.execute(base_query)
     total_count = total_result.scalar_one()
-    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    total_pages = max(1, (total_count + size_num - 1) // size_num)
 
     query = (
         select(WatchEvent, Media)
@@ -458,7 +458,7 @@ async def get_history(
             or_(Media.title.ilike(f"%{search_term}%"), Show.title.ilike(f"%{search_term}%"))
         )
 
-    query = query.offset(offset).limit(page_size)
+    query = query.offset(offset).limit(size_num)
 
     result = await db.execute(query)
     rows = result.all()
@@ -488,8 +488,8 @@ async def get_history(
                     event["media"]["show_title"] = t["title"]
 
     return {
-        "page": page,
-        "page_size": page_size,
+        "page": page_num,
+        "page_size": size_num,
         "total_results": total_count,
         "total_pages": total_pages,
         "results": events,
