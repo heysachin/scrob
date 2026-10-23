@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from pydantic import BaseModel, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import text, select, update, delete, func, cast, bindparam, DateTime, literal_column
+from sqlalchemy import text, select, update, delete, func, cast, bindparam, DateTime, literal_column, or_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.dialects.postgresql import insert, JSONB
 
@@ -646,6 +646,11 @@ def _nuvio_profile_id(conn: MediaServerConnection) -> int:
 def _nuvio_imdb_id(entity: Media | Show | None) -> str | None:
     if entity is None:
         return None
+    direct = getattr(entity, "imdb_id", None)
+    if direct:
+        direct_str = str(direct).strip()
+        if direct_str.startswith("tt") and direct_str[2:].isdigit():
+            return direct_str
     data = entity.tmdb_data or {}
     value = data.get("imdb_id") or (data.get("external_ids") or {}).get("imdb_id")
     imdb_id = str(value or "").strip()
@@ -703,6 +708,8 @@ async def _ensure_nuvio_imdb_ids(
         stored_external_ids["imdb_id"] = imdb_id
         tmdb_data["external_ids"] = stored_external_ids
         entity.tmdb_data = tmdb_data
+        if hasattr(entity, "imdb_id"):
+            entity.imdb_id = imdb_id
 
     await asyncio.gather(
         *[
@@ -1142,7 +1149,10 @@ async def _push_nuvio_playback_progress(
     conns_filter = [
         MediaServerConnection.user_id == user_id,
         MediaServerConnection.type == "nuvio",
-        MediaServerConnection.push_playback == True,
+        or_(
+            MediaServerConnection.push_playback == True,
+            MediaServerConnection.push_on_pull == True,
+        ),
     ]
     if exclude_connection_id is not None:
         conns_filter.append(MediaServerConnection.id != exclude_connection_id)
@@ -1192,6 +1202,7 @@ async def _fan_out_changes_to_other_connections(
     new_collected_ids: set[int] | None = None,
     removed_collected_ids: set[int] | None = None,
     new_playback_media_ids: set[int] | None = None,
+    is_pull: bool = False,
 ) -> None:
     """Push an inbound sync delta to every enabled media server and cloud target.
 
@@ -1249,11 +1260,22 @@ async def _fan_out_changes_to_other_connections(
         select(MediaServerConnection).where(*conns_filter)
     )
     other_conns = other_conns_result.scalars().all()
-    push_candidates = [
-        conn
-        for conn in other_conns
-        if getattr(conn, "push_collection", False) or conn.push_watched or conn.push_ratings or conn.push_playback
-    ]
+    if is_pull:
+        push_candidates = [
+            conn
+            for conn in other_conns
+            if conn.type == "nuvio" and getattr(conn, "push_on_pull", True)
+        ]
+    else:
+        push_candidates = [
+            conn
+            for conn in other_conns
+            if getattr(conn, "push_collection", False)
+            or conn.push_watched
+            or conn.push_ratings
+            or conn.push_playback
+            or (conn.type == "nuvio" and getattr(conn, "push_on_pull", True))
+        ]
 
     push_tasks = []
     server_rating_changes = {key: 0.0 for key in removed_ratings}
@@ -1295,15 +1317,12 @@ async def _fan_out_changes_to_other_connections(
         nuvio_watched_items: list[dict] | None = None
         nuvio_progress_items: list[dict] | None = None
         has_nuvio_collection_target = any(
-            conn.type == "nuvio" and getattr(conn, "push_collection", False)
+            conn.type == "nuvio" and (getattr(conn, "push_collection", False) or (is_pull and getattr(conn, "push_on_pull", True)))
             for conn in push_candidates
         )
         nuvio_api_key = (
             await _get_effective_tmdb_key(db, settings)
-            if any(
-                conn.type == "nuvio" and (conn.push_watched or getattr(conn, "push_collection", False) or getattr(conn, "push_playback", False))
-                for conn in push_candidates
-            )
+            if any(conn.type == "nuvio" for conn in push_candidates)
             else None
         )
         stremio_api_key = (
@@ -1363,7 +1382,12 @@ async def _fan_out_changes_to_other_connections(
             else []
         )
 
-        async def _push_to_nuvio(conn: MediaServerConnection, items: list[dict]) -> bool:
+        async def _push_nuvio_all(
+            conn: MediaServerConnection,
+            watched_items: list[dict] | None,
+            push_library: bool,
+            progress_items: list[dict] | None,
+        ) -> bool:
             async def _persist_refresh(session: nuvio.NuvioSession) -> None:
                 conn.token = session.refresh_token
                 await db.commit()
@@ -1372,30 +1396,31 @@ async def _fan_out_changes_to_other_connections(
                 # See core/nuvio.py's connection_lock docstring - conn may
                 # have been loaded before another request already rotated
                 # this single-use refresh token while this one waited.
-                await db.refresh(conn)
-                await nuvio.push_watched_items(
-                    conn.url,
-                    conn.token,
-                    _nuvio_profile_id(conn),
-                    items,
-                    on_refresh=_persist_refresh,
-                )
-            return True
-
-        async def _push_progress_to_nuvio(conn: MediaServerConnection, items: list[dict]) -> bool:
-            async def _persist_refresh(session: nuvio.NuvioSession) -> None:
-                conn.token = session.refresh_token
-                await db.commit()
-
-            async with nuvio.connection_lock(conn.id):
-                await db.refresh(conn)
-                await nuvio.push_watch_progress(
-                    conn.url,
-                    conn.token,
-                    _nuvio_profile_id(conn),
-                    items,
-                    on_refresh=_persist_refresh,
-                )
+                if hasattr(db, "refresh"):
+                    await db.refresh(conn)
+                if watched_items:
+                    await nuvio.push_watched_items(
+                        conn.url,
+                        conn.token,
+                        _nuvio_profile_id(conn),
+                        watched_items,
+                        on_refresh=_persist_refresh,
+                    )
+                if push_library and nuvio_changed_content_ids:
+                    await _push_nuvio_library_delta(
+                        db,
+                        conn,
+                        nuvio_library_items,
+                        nuvio_changed_content_ids,
+                    )
+                if progress_items:
+                    await nuvio.push_watch_progress(
+                        conn.url,
+                        conn.token,
+                        _nuvio_profile_id(conn),
+                        progress_items,
+                        on_refresh=_persist_refresh,
+                    )
             return True
 
         watched_at_by_media = await _latest_watched_at(db, user_id, list(new_watched_ids)) if new_watched_ids else {}
@@ -1417,7 +1442,12 @@ async def _fan_out_changes_to_other_connections(
                     )
                 continue
             if conn.type == "nuvio":
-                if conn.push_watched and new_watched_ids:
+                should_push_watched = conn.push_watched or (is_pull and getattr(conn, "push_on_pull", True))
+                should_push_playback = getattr(conn, "push_playback", False) or (is_pull and getattr(conn, "push_on_pull", True))
+                should_push_collection = getattr(conn, "push_collection", False) or (is_pull and getattr(conn, "push_on_pull", True))
+
+                conn_watched = None
+                if should_push_watched and new_watched_ids:
                     if nuvio_watched_items is None:
                         nuvio_watched_items = await _build_nuvio_watched_items(
                             db,
@@ -1425,20 +1455,10 @@ async def _fan_out_changes_to_other_connections(
                             new_watched_ids,
                             api_key=nuvio_api_key,
                         )
-                    if nuvio_watched_items:
-                        push_tasks.append(_guarded(_push_to_nuvio(conn, nuvio_watched_items)))
-                if conn.push_collection and nuvio_changed_content_ids:
-                    push_tasks.append(
-                        _guarded(
-                            _push_nuvio_library_delta(
-                                db,
-                                conn,
-                                nuvio_library_items,
-                                nuvio_changed_content_ids,
-                            )
-                        )
-                    )
-                if getattr(conn, "push_playback", False) and new_playback_media_ids:
+                    conn_watched = nuvio_watched_items
+
+                conn_progress = None
+                if should_push_playback and new_playback_media_ids:
                     if nuvio_progress_items is None:
                         nuvio_progress_items = await _build_nuvio_progress_items(
                             db,
@@ -1446,8 +1466,21 @@ async def _fan_out_changes_to_other_connections(
                             api_key=nuvio_api_key,
                             media_ids=new_playback_media_ids,
                         )
-                    if nuvio_progress_items:
-                        push_tasks.append(_guarded(_push_progress_to_nuvio(conn, nuvio_progress_items)))
+                    conn_progress = nuvio_progress_items
+
+                conn_library = should_push_collection and bool(nuvio_changed_content_ids)
+
+                if conn_watched or conn_progress or conn_library:
+                    push_tasks.append(
+                        _guarded(
+                            _push_nuvio_all(
+                                conn,
+                                conn_watched,
+                                conn_library,
+                                conn_progress,
+                            )
+                        )
+                    )
                 continue
             if conn.push_watched:
                 for mid in new_watched_ids:
@@ -1501,9 +1534,9 @@ async def _fan_out_changes_to_other_connections(
 
     season_tmdb_ids: dict[RatingKey, int] = {}
     # ── Trakt fan-out ────────────────────────────────────────────────────────
-    push_trakt_watched = settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_watched and settings.trakt_access_token and settings.trakt_client_id
-    push_trakt_ratings = settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_ratings and settings.trakt_access_token and settings.trakt_client_id
-    push_trakt_collection = settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_collection and settings.trakt_access_token and settings.trakt_client_id
+    push_trakt_watched = not is_pull and settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_watched and settings.trakt_access_token and settings.trakt_client_id
+    push_trakt_ratings = not is_pull and settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_ratings and settings.trakt_access_token and settings.trakt_client_id
+    push_trakt_collection = not is_pull and settings and exclude_cloud_source != CollectionSource.trakt and settings.trakt_push_collection and settings.trakt_access_token and settings.trakt_client_id
 
     if (push_trakt_watched or push_trakt_ratings or push_trakt_collection) and all_changed_ids:
         # Validate / refresh the token before the fan-out (own session - this
@@ -1641,9 +1674,9 @@ async def _fan_out_changes_to_other_connections(
                 )
 
     # ── MDBList fan-out ──────────────────────────────────────────────────────
-    push_mdblist_watched = settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_watched and settings.mdblist_api_key
-    push_mdblist_ratings = settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_ratings and settings.mdblist_api_key
-    push_mdblist_collection = settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_collection and settings.mdblist_api_key
+    push_mdblist_watched = not is_pull and settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_watched and settings.mdblist_api_key
+    push_mdblist_ratings = not is_pull and settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_ratings and settings.mdblist_api_key
+    push_mdblist_collection = not is_pull and settings and exclude_cloud_source != CollectionSource.mdblist and settings.mdblist_push_collection and settings.mdblist_api_key
 
     if (push_mdblist_watched or push_mdblist_ratings or push_mdblist_collection) and all_changed_ids:
         from core import mdblist as mdblist_client
@@ -1766,14 +1799,16 @@ async def _fan_out_changes_to_other_connections(
 
     # ── Simkl fan-out ────────────────────────────────────────────────────────
     push_simkl_watched = (
-        settings
+        not is_pull
+        and settings
         and exclude_cloud_source != CollectionSource.simkl
         and settings.simkl_push_watched
         and settings.simkl_access_token
         and settings.simkl_client_id
     )
     push_simkl_ratings = (
-        settings
+        not is_pull
+        and settings
         and exclude_cloud_source != CollectionSource.simkl
         and settings.simkl_push_ratings
         and settings.simkl_access_token
@@ -1902,7 +1937,8 @@ async def _fan_out_changes_to_other_connections(
 
     # ── WeTrakr fan-out ─────────────────────────────────────────────────────
     push_wetrakr = bool(
-        settings
+        not is_pull
+        and settings
         and exclude_cloud_source != CollectionSource.wetrakr
         and getattr(settings, "wetrakr_access_token", None)
         and (getattr(settings, "wetrakr_push_watched", False) or getattr(settings, "wetrakr_push_ratings", False))
@@ -1953,6 +1989,9 @@ async def _fan_out_changes_to_other_connections(
         for i in range(0, len(push_tasks), FAN_OUT_CHUNK_SIZE):
             chunk = push_tasks[i:i + FAN_OUT_CHUNK_SIZE]
             results = await asyncio.gather(*chunk, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.warning("Fan out push task failed: %s", r)
             failed += sum(1 for r in results if isinstance(r, Exception))
         if failed:
             print(f"  {failed}/{len(push_tasks)} fan-out push tasks failed (non-fatal)")
@@ -3135,8 +3174,19 @@ async def _run_jellyfin_sync(user_id: int, job_id: int, movie_limit: int, show_l
                 print(f"Jellyfin sync job {job_id}: pushed watched state for {pushed_back} newly collected item(s).")
 
             print(f"Jellyfin sync job {job_id} completed. Stats: {stats}")
-            # A pull only populates scrob's own data — it never automatically pushes to
-            # other connections; users push explicitly per-service (the "Push" buttons).
+            if _new_watched or _new_ratings or _new_collected:
+                try:
+                    await _fan_out_changes_to_other_connections(
+                        db,
+                        user_id,
+                        exclude_connection_id=conn.id,
+                        new_watched_ids=_new_watched,
+                        new_ratings=_new_ratings,
+                        new_collected_ids=_new_collected,
+                        is_pull=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Jellyfin sync fan-out to other connections failed: %s", exc)
             all_warnings = await _stamp_matched_show_warnings(db, user_id, all_warnings)
             await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.completed, stats=stats, warnings=all_warnings or None, updated_at=func.now()))
             await db.commit()
@@ -3350,8 +3400,19 @@ async def _run_emby_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                 print(f"Emby sync job {job_id}: pushed watched state for {pushed_back} newly collected item(s).")
 
             print(f"Emby sync job {job_id} completed. Stats: {stats}")
-            # A pull only populates scrob's own data — it never automatically pushes to
-            # other connections; users push explicitly per-service (the "Push" buttons).
+            if _new_watched or _new_ratings or _new_collected:
+                try:
+                    await _fan_out_changes_to_other_connections(
+                        db,
+                        user_id,
+                        exclude_connection_id=conn.id,
+                        new_watched_ids=_new_watched,
+                        new_ratings=_new_ratings,
+                        new_collected_ids=_new_collected,
+                        is_pull=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Emby sync fan-out to other connections failed: %s", exc)
             all_warnings = await _stamp_matched_show_warnings(db, user_id, all_warnings)
             await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.completed, stats=stats, warnings=all_warnings or None, updated_at=func.now()))
             await db.commit()
@@ -4502,6 +4563,19 @@ async def _run_plex_sync(user_id: int, job_id: int, movie_limit: int, show_limit
                     print(f"Plex sync job {job_id}: removed {len(removed_media_ids)} item(s) no longer in Plex.")
 
             print(f"Plex sync job {job_id} completed. Stats: {stats}")
+            if _new_watched or _new_ratings or _new_collected:
+                try:
+                    await _fan_out_changes_to_other_connections(
+                        db,
+                        user_id,
+                        exclude_connection_id=conn.id,
+                        new_watched_ids=_new_watched,
+                        new_ratings=_new_ratings,
+                        new_collected_ids=_new_collected,
+                        is_pull=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Plex sync fan-out to other connections failed: %s", exc)
             # A pull only populates scrob's own data — it never automatically pushes to
             # other connections; users push explicitly per-service (the "Push" buttons).
             # The watchlist reconcile above is the one exception: it honors this
@@ -4957,7 +5031,8 @@ async def _run_nuvio_sync(
                 # See core/nuvio.py's connection_lock docstring - conn may
                 # have been loaded before another request already rotated
                 # this single-use refresh token while this one waited.
-                await db.refresh(conn)
+                if hasattr(db, "refresh"):
+                    await db.refresh(conn)
                 _, data = await nuvio.pull_sync_data(
                     conn.url, conn.token, profile_id, on_refresh=_persist_refresh
                 )
@@ -5628,8 +5703,20 @@ async def _run_stremio_sync(
                 removed_ids=removed_ids,
                 complete_snapshot_ids=complete_snapshot_ids,
             )
-            # A pull only populates scrob's own data — it never automatically pushes to
-            # other connections; users push explicitly per-service (the "Push" buttons).
+            if new_watched_ids or new_collected_ids or removed_collected_ids:
+                try:
+                    await _fan_out_changes_to_other_connections(
+                        db,
+                        user_id,
+                        exclude_connection_id=conn.id,
+                        new_watched_ids=new_watched_ids,
+                        new_ratings={},
+                        new_collected_ids=new_collected_ids,
+                        removed_collected_ids=removed_collected_ids,
+                        is_pull=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Stremio sync fan-out to other connections failed: %s", exc)
             conn.stremio_pull_cursor_at = pull_started_at
             conn.stremio_full_sync_done = True
             warnings = await _stamp_matched_show_warnings(db, user_id, warnings)

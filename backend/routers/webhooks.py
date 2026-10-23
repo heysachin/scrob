@@ -770,6 +770,18 @@ async def _write_watch_event(
         )
         await db.flush()
         await record_rewatch_progress(db, user_id, media_id, event.id)
+        try:
+            from routers.sync import _fan_out_changes_to_other_connections
+            await _fan_out_changes_to_other_connections(
+                db,
+                user_id,
+                exclude_connection_id=None,
+                new_watched_ids={media_id},
+                new_ratings={},
+                is_pull=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to auto-push watched event to Nuvio for user %s: %s", user_id, exc)
         return True
     else:
         # Just update in-progress state, don't add to WatchEvent (History)

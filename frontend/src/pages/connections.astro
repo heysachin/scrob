@@ -233,9 +233,10 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                           ...(conn.type === "nuvio" || conn.type === "stremio" ? [{ key: "push_playback", label: "Playback progress" }] : []),
                           ...(conn.type === "nuvio" || conn.type === "stremio" ? [] : [{ key: "push_ratings", label: "Ratings" }]),
                           ...(conn.type === "plex" ? [{ key: "plex_push_watchlist", label: "Watchlist" }] : []),
+                          ...(conn.type === "nuvio" ? [{ key: "push_on_pull", label: "Always sync back on pull events" }] : []),
                         ].map(({ key, label }) => (
                           <label class="flex items-center gap-3 cursor-pointer group">
-                            <input type="checkbox" class="conn-pref-checkbox w-4 h-4 rounded cursor-pointer" data-conn-id={conn.id} data-pref={key} checked={!!conn[key as keyof typeof conn]} />
+                            <input type="checkbox" class="conn-pref-checkbox w-4 h-4 rounded cursor-pointer" data-conn-id={conn.id} data-pref={key} checked={key === "push_on_pull" ? conn.push_on_pull !== false : !!conn[key as keyof typeof conn]} />
                             <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">{label}</span>
                           </label>
                         ))}
@@ -438,6 +439,10 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                       <label id="new-push-playback-row" class="hidden new-provider-pref flex items-center gap-3 cursor-pointer group">
                         <input type="checkbox" id="new-push-playback" class="w-4 h-4 rounded cursor-pointer" disabled />
                         <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Playback progress</span>
+                      </label>
+                      <label id="new-push-on-pull-row" class="hidden new-provider-pref flex items-center gap-3 cursor-pointer group">
+                        <input type="checkbox" id="new-push-on-pull" class="w-4 h-4 rounded cursor-pointer" checked disabled />
+                        <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Always sync back on pull events</span>
                       </label>
                     </div>
                     <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
@@ -5153,6 +5158,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       const pushCollection = document.getElementById('new-push-collection') as HTMLInputElement | null;
       pushCollection?.closest('label')?.classList.toggle('hidden', !isCloud);
       if (pushCollection) pushCollection.disabled = !isCloud;
+      const pushOnPull = document.getElementById('new-push-on-pull') as HTMLInputElement | null;
+      pushOnPull?.closest('label')?.classList.toggle('hidden', !isNuvio);
+      if (pushOnPull) pushOnPull.disabled = !isNuvio;
       for (const checkbox of [syncRatings, pushRatings]) {
         checkbox?.closest('label')?.classList.toggle('hidden', isCloud);
         if (checkbox) checkbox.disabled = isCloud;
@@ -5465,6 +5473,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             push_collection: type === 'nuvio' && ((document.getElementById('new-push-collection') as HTMLInputElement)?.checked ?? false),
             push_playback: type === 'nuvio' && ((document.getElementById('new-push-playback') as HTMLInputElement)?.checked ?? false),
             push_ratings: type === 'nuvio' ? false : ((document.getElementById('new-push-ratings') as HTMLInputElement)?.checked ?? false),
+            push_on_pull: type === 'nuvio' ? ((document.getElementById('new-push-on-pull') as HTMLInputElement)?.checked ?? true) : true,
             auto_sync_interval: (() => {
               const value = (document.getElementById('new-auto-sync') as HTMLSelectElement)?.value;
               return value ? parseFloat(value) : null;

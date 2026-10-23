@@ -310,6 +310,7 @@ class MediaServerConnectionBase(BaseModel):
     push_collection: bool = False
     push_playback: bool = False
     push_ratings: bool = False
+    push_on_pull: bool = True
     auto_sync_interval: Optional[float] = None
     auto_push_interval: Optional[float] = None
     watchlist_to_radarr: bool = False
@@ -341,6 +342,7 @@ class MediaServerConnectionUpdate(BaseModel):
     push_collection: Optional[bool] = None
     push_playback: Optional[bool] = None
     push_ratings: Optional[bool] = None
+    push_on_pull: Optional[bool] = None
     auto_sync_interval: Optional[float] = None
     auto_push_interval: Optional[float] = None
     watchlist_to_radarr: Optional[bool] = None
