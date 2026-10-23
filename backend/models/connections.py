@@ -39,6 +39,7 @@ class MediaServerConnection(Base):
     push_collection  : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     push_playback    : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     push_ratings     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    push_on_pull     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
 
     # Auto sync interval in hours (null = disabled)
     auto_sync_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -91,4 +92,5 @@ class MediaServerConnection(Base):
             or self.push_playback
             or self.push_ratings
             or self.plex_push_watchlist
+            or self.push_on_pull
         )

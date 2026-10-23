@@ -223,3 +223,127 @@ class NuvioAutoPushAndTimingTests(unittest.IsolatedAsyncioTestCase):
             pps = (await s.execute(select(PlaybackProgress).where(PlaybackProgress.media_id == 501))).scalars().all()
             self.assertEqual(len(pps), 1)
             self.assertEqual(pps[0].progress_percent, 0.40)
+
+    # 6. Test push_on_pull=True automatically fans out on pull events
+    async def test_pull_event_fans_out_to_nuvio_when_push_on_pull_true(self):
+        async with self.Session() as s:
+            conn = MediaServerConnection(
+                id=601,
+                user_id=1,
+                type="nuvio",
+                name="Nuvio Cloud",
+                url="https://api.nuvio.tv",
+                token="test-token",
+                server_user_id="1",
+                push_watched=False,
+                push_playback=False,
+                push_on_pull=True,
+            )
+            s.add(conn)
+            movie = Media(id=601, media_type=MediaType.movie, title="Pull Movie", imdb_id="tt6000001")
+            s.add(movie)
+            s.add(WatchEvent(user_id=1, media_id=601, completed=True, watched_at=datetime(2026, 10, 23, 10, 0, 0)))
+            s.add(PlaybackProgress(user_id=1, media_id=601, progress_percent=0.6, progress_seconds=3600, updated_at=datetime(2026, 10, 23, 12, 0, 0)))
+            await s.commit()
+
+            with patch("core.nuvio.push_watched_items", AsyncMock()) as mock_push_watched, \
+                 patch("core.nuvio.push_watch_progress", AsyncMock()) as mock_push_progress:
+                await sync_router._fan_out_changes_to_other_connections(
+                    s,
+                    user_id=1,
+                    exclude_connection_id=None,
+                    new_watched_ids={601},
+                    new_ratings={},
+                    new_playback_media_ids={601},
+                    is_pull=True,
+                )
+                self.assertEqual(mock_push_watched.call_count, 1)
+                self.assertEqual(mock_push_progress.call_count, 1)
+                # Verify items sent to Nuvio
+                w_items = mock_push_watched.call_args[0][3]
+                p_items = mock_push_progress.call_args[0][3]
+                self.assertEqual(w_items[0]["content_id"], "tt6000001")
+                self.assertEqual(p_items[0]["content_id"], "tt6000001")
+
+    # 7. Test push_on_pull=False blocks fan-out on pull events
+    async def test_pull_event_does_not_fan_out_when_push_on_pull_false(self):
+        async with self.Session() as s:
+            conn = MediaServerConnection(
+                id=701,
+                user_id=1,
+                type="nuvio",
+                name="Nuvio Cloud",
+                url="https://api.nuvio.tv",
+                token="test-token",
+                server_user_id="1",
+                push_watched=False,
+                push_playback=False,
+                push_on_pull=False,
+            )
+            s.add(conn)
+            movie = Media(id=701, media_type=MediaType.movie, title="Pull Movie 2", imdb_id="tt7000002")
+            s.add(movie)
+            await s.commit()
+
+            with patch("core.nuvio.push_watched_items", AsyncMock()) as mock_push_watched:
+                await sync_router._fan_out_changes_to_other_connections(
+                    s,
+                    user_id=1,
+                    exclude_connection_id=None,
+                    new_watched_ids={701},
+                    new_ratings={},
+                    is_pull=True,
+                )
+                self.assertEqual(mock_push_watched.call_count, 0)
+
+    # 8. Test non-Nuvio servers (e.g. Plex) are not pushed during pull events (is_pull=True)
+    async def test_pull_event_does_not_push_to_other_media_servers(self):
+        async with self.Session() as s:
+            plex_conn = MediaServerConnection(
+                id=801,
+                user_id=1,
+                type="plex",
+                name="Home Plex",
+                url="http://192.168.1.100:32400",
+                token="plex-token",
+                push_watched=True,
+            )
+            s.add(plex_conn)
+            movie = Media(id=801, media_type=MediaType.movie, title="Plex Movie", tmdb_id=8001)
+            s.add(movie)
+            await s.commit()
+
+            with patch("core.plex.mark_watched", AsyncMock()) as mock_plex_watched:
+                await sync_router._fan_out_changes_to_other_connections(
+                    s,
+                    user_id=1,
+                    exclude_connection_id=None,
+                    new_watched_ids={801},
+                    new_ratings={},
+                    is_pull=True,
+                )
+                self.assertEqual(mock_plex_watched.call_count, 0)
+
+    # 9. Test _push_nuvio_playback_progress respects push_on_pull=True
+    async def test_push_nuvio_playback_progress_respects_push_on_pull(self):
+        async with self.Session() as s:
+            conn = MediaServerConnection(
+                id=901,
+                user_id=1,
+                type="nuvio",
+                name="Nuvio Cloud",
+                url="https://api.nuvio.tv",
+                token="test-token",
+                server_user_id="1",
+                push_playback=False,
+                push_on_pull=True,
+            )
+            s.add(conn)
+            movie = Media(id=901, media_type=MediaType.movie, title="Progress Movie", imdb_id="tt9000001")
+            s.add(movie)
+            s.add(PlaybackProgress(user_id=1, media_id=901, progress_percent=0.75, progress_seconds=4500, updated_at=datetime(2026, 10, 23, 14, 0, 0)))
+            await s.commit()
+
+            with patch("core.nuvio.push_watch_progress", AsyncMock()) as mock_push_progress:
+                await sync_router._push_nuvio_playback_progress(s, user_id=1, media_ids=[901])
+                self.assertEqual(mock_push_progress.call_count, 1)

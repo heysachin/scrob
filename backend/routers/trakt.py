@@ -2079,6 +2079,7 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                     new_watched_ids=_new_watched,
                     new_ratings=_new_ratings,
                     new_playback_media_ids=_new_playback,
+                    is_pull=True,
                 )
             except Exception as exc:
                 logger.warning("Trakt sync fan-out to other connections failed: %s", exc)

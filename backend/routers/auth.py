@@ -692,6 +692,7 @@ async def create_connection(
         push_collection=body.push_collection if cloud_media_provider else False,
         push_playback=body.push_playback if cloud_media_provider else False,
         push_ratings=body.push_ratings if not cloud_media_provider else False,
+        push_on_pull=body.push_on_pull,
         auto_sync_interval=body.auto_sync_interval,
         auto_push_interval=body.auto_push_interval,
     )
