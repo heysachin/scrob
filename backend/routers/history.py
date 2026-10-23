@@ -713,14 +713,104 @@ async def get_continue_watching(
         .where(*filters)
         .order_by(desc(PlaybackProgress.updated_at))
     )
-    if limit is not None:
-        query = query.limit(limit)
+    int_limit: int | None = None
+    if isinstance(limit, int):
+        int_limit = limit
+    elif hasattr(limit, "default") and isinstance(getattr(limit, "default"), int):
+        int_limit = getattr(limit, "default")
+
+    if int_limit is not None:
+        query = query.limit(max(int_limit * 5, 100))
     result = await db.execute(query)
     rows = result.all()
-    items = [format_event(e, m) for e, m in rows]
-    for item in items:
-        # Only ever true for movies - episodes have no drop concept.
+    if not rows:
+        return {"continue_watching": []}
+
+    all_media_ids = [m.id for _, m in rows]
+    show_ids = {m.show_id for _, m in rows if m.media_type == MediaType.episode and m.show_id}
+
+    watch_res = await db.execute(
+        select(WatchEvent.media_id, WatchEvent.watched_at)
+        .where(
+            WatchEvent.user_id == current_user.id,
+            WatchEvent.completed == True,
+            WatchEvent.media_id.in_(all_media_ids),
+        )
+    )
+    latest_watched_by_media: dict[int, datetime] = {}
+    for mid, wat in watch_res.all():
+        if wat and (mid not in latest_watched_by_media or wat > latest_watched_by_media[mid]):
+            latest_watched_by_media[mid] = wat
+
+    show_latest_watched: dict[int, datetime] = {}
+    furthest_watched_by_show: dict[int, tuple[int, int]] = {}
+    if show_ids:
+        show_events = await db.execute(
+            select(Media.show_id, Media.season_number, Media.episode_number, WatchEvent.watched_at)
+            .join(WatchEvent, WatchEvent.media_id == Media.id)
+            .where(
+                WatchEvent.user_id == current_user.id,
+                WatchEvent.completed == True,
+                Media.show_id.in_(show_ids),
+                Media.season_number.isnot(None),
+                Media.episode_number.isnot(None),
+            )
+            .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
+        )
+        for s_id, s_num, e_num, wat in show_events.all():
+            if s_id not in furthest_watched_by_show:
+                furthest_watched_by_show[s_id] = (s_num, e_num)
+            if wat and (s_id not in show_latest_watched or wat > show_latest_watched[s_id]):
+                show_latest_watched[s_id] = wat
+
+    valid_rows: list[tuple[PlaybackProgress, Media, datetime]] = []
+    stale_progress_ids: list[int] = []
+    seen_shows: set[int] = set()
+
+    for progress, media in rows:
+        if media.media_type == MediaType.movie:
+            wat = latest_watched_by_media.get(media.id)
+            if wat and wat >= progress.updated_at:
+                stale_progress_ids.append(progress.id)
+                continue
+            activity_at = progress.updated_at
+            valid_rows.append((progress, media, activity_at))
+        elif media.media_type == MediaType.episode:
+            wat = latest_watched_by_media.get(media.id)
+            if wat and wat >= progress.updated_at:
+                stale_progress_ids.append(progress.id)
+                continue
+            if media.show_id:
+                furthest = furthest_watched_by_show.get(media.show_id)
+                if furthest and media.season_number is not None and media.episode_number is not None:
+                    if (media.season_number, media.episode_number) < furthest:
+                        stale_progress_ids.append(progress.id)
+                        continue
+                if media.show_id in seen_shows:
+                    stale_progress_ids.append(progress.id)
+                    continue
+                seen_shows.add(media.show_id)
+                activity_at = max(progress.updated_at, show_latest_watched.get(media.show_id, progress.updated_at))
+            else:
+                activity_at = progress.updated_at
+            valid_rows.append((progress, media, activity_at))
+        else:
+            valid_rows.append((progress, media, progress.updated_at))
+
+    if stale_progress_ids:
+        await db.execute(delete(PlaybackProgress).where(PlaybackProgress.id.in_(stale_progress_ids)))
+        await db.commit()
+
+    valid_rows.sort(key=lambda x: x[2], reverse=True)
+    if int_limit is not None:
+        valid_rows = valid_rows[:int_limit]
+
+    items = []
+    for progress, media, activity_at in valid_rows:
+        item = format_event(progress, media)
+        item["watched_at"] = activity_at.isoformat() if activity_at else None
         item["media"]["dropped"] = item["media"]["id"] in dropped_movie_ids
+        items.append(item)
     if items:
         await enrich_with_state(db, current_user.id, [i["media"] for i in items])
         lang = await get_user_metadata_language(db, current_user.id)

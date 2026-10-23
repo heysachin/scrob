@@ -18,7 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core import trakt as trakt_client
@@ -932,6 +932,7 @@ async def _apply_trakt_import(
         "removed_playback": 0,
     }
     _new_watched: set[int] = set()
+    _new_playback: set[int] = set()
     _new_ratings: RatingChanges = {}
     watched_processed = 0
     history_error_count = stats["errors"]
@@ -1050,6 +1051,24 @@ async def _apply_trakt_import(
         # Re-fetch watch times (may have grown from movie sync)
         existing_times = await load_existing_watch_times(db, user_id)
 
+        # Track furthest watched (season, episode) per show to detect stale episode progress
+        show_furthest_query = (
+            select(Media.show_id, Media.season_number, Media.episode_number)
+            .join(WatchEvent, WatchEvent.media_id == Media.id)
+            .where(
+                WatchEvent.user_id == user_id,
+                WatchEvent.completed == True,
+                Media.show_id.isnot(None),
+                Media.season_number.isnot(None),
+                Media.episode_number.isnot(None),
+            )
+            .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
+        )
+        furthest_watched_per_show: dict[int, tuple[int, int]] = {}
+        for s_id, s_num, e_num in (await db.execute(show_furthest_query)).all():
+            if s_id not in furthest_watched_per_show:
+                furthest_watched_per_show[s_id] = (s_num, e_num)
+
         # Group plays by show so _get_or_create_show only runs once per show
         plays_by_show: dict[int, list[dict]] = {}
         for entry in history_episodes:
@@ -1106,6 +1125,10 @@ async def _apply_trakt_import(
                                 await db.flush()
                                 await record_rewatch_progress(db, user_id, media.id, event.id)
                                 existing_times.setdefault(media.id, []).append(watched_at or utcnow())
+                                furthest_watched_per_show[show.id] = max(
+                                    furthest_watched_per_show.get(show.id, (0, 0)),
+                                    (season_num, ep_num),
+                                )
                                 _new_watched.add(media.id)
                                 stats["episodes"] += 1
                                 stats["imported_episodes"] += 1
@@ -1170,6 +1193,31 @@ async def _apply_trakt_import(
         if playback_movies or playback_episodes:
             print(f"  {len(playback_movies)} movie and {len(playback_episodes)} episode in-progress plays fetched from Trakt")
 
+        try:
+            existing_times
+        except NameError:
+            existing_times = await load_existing_watch_times(db, user_id)
+
+        try:
+            furthest_watched_per_show
+        except NameError:
+            furthest_watched_per_show = {}
+            show_furthest_query = (
+                select(Media.show_id, Media.season_number, Media.episode_number)
+                .join(WatchEvent, WatchEvent.media_id == Media.id)
+                .where(
+                    WatchEvent.user_id == user_id,
+                    WatchEvent.completed == True,
+                    Media.show_id.isnot(None),
+                    Media.season_number.isnot(None),
+                    Media.episode_number.isnot(None),
+                )
+                .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
+            )
+            for s_id, s_num, e_num in (await db.execute(show_furthest_query)).all():
+                if s_id not in furthest_watched_per_show:
+                    furthest_watched_per_show[s_id] = (s_num, e_num)
+
         seen_trakt_playback_ids: set[int] = set()
 
         for entry in playback_movies:
@@ -1198,20 +1246,17 @@ async def _apply_trakt_import(
                 stats["skipped"] += 1
                 continue
 
-            paused_at = _parse_trakt_datetime(entry.get("paused_at")) or utcnow()
+            paused_at = (
+                _parse_trakt_datetime(entry.get("paused_at"))
+                or _parse_trakt_datetime(entry.get("updated_at"))
+                or _parse_trakt_datetime(entry.get("created_at"))
+            )
 
             try:
                 async with db.begin_nested():
                     media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
                     if not media:
                         stats["errors"] += 1
-                        continue
-
-                    # If this movie has already been completed at or after paused_at, progress is stale
-                    latest_watch_times = existing_times.get(media.id) or []
-                    if any(wt >= paused_at for wt in latest_watch_times):
-                        stats["skipped"] += 1
-                        stats["skipped_playback_stale"] += 1
                         continue
 
                     existing_pp = (
@@ -1222,6 +1267,23 @@ async def _apply_trakt_import(
                             )
                         )
                     ).scalar_one_or_none()
+
+                    latest_watch_times = existing_times.get(media.id) or []
+                    if not paused_at:
+                        if existing_pp and existing_pp.updated_at:
+                            paused_at = existing_pp.updated_at
+                        elif latest_watch_times:
+                            stats["skipped"] += 1
+                            stats["skipped_playback_stale"] += 1
+                            continue
+                        else:
+                            paused_at = datetime(1970, 1, 1)
+
+                    # If this movie has already been completed at or after paused_at, progress is stale
+                    if any(wt >= paused_at for wt in latest_watch_times):
+                        stats["skipped"] += 1
+                        stats["skipped_playback_stale"] += 1
+                        continue
 
                     runtime_mins = getattr(media, "runtime", None) or 0
                     progress_seconds = int(progress_percent * runtime_mins * 60) if runtime_mins > 0 else 0
@@ -1237,6 +1299,7 @@ async def _apply_trakt_import(
                         existing_pp.updated_at = paused_at
                         existing_pp.trakt_playback_id = pb_id
                         stats["playback_movies"] += 1
+                        _new_playback.add(media.id)
                     else:
                         db.add(
                             PlaybackProgress(
@@ -1249,6 +1312,7 @@ async def _apply_trakt_import(
                             )
                         )
                         stats["playback_movies"] += 1
+                        _new_playback.add(media.id)
             except Exception as exc:
                 logger.warning("Error processing Trakt movie playback progress for tmdb=%s: %s", tmdb_id, exc)
                 stats["errors"] += 1
@@ -1288,7 +1352,11 @@ async def _apply_trakt_import(
                 stats["skipped"] += 1
                 continue
 
-            paused_at = _parse_trakt_datetime(entry.get("paused_at")) or utcnow()
+            paused_at = (
+                _parse_trakt_datetime(entry.get("paused_at"))
+                or _parse_trakt_datetime(entry.get("updated_at"))
+                or _parse_trakt_datetime(entry.get("created_at"))
+            )
 
             try:
                 async with db.begin_nested():
@@ -1303,12 +1371,6 @@ async def _apply_trakt_import(
                         stats["errors"] += 1
                         continue
 
-                    latest_watch_times = existing_times.get(media.id) or []
-                    if any(wt >= paused_at for wt in latest_watch_times):
-                        stats["skipped"] += 1
-                        stats["skipped_playback_stale"] += 1
-                        continue
-
                     existing_pp = (
                         await db.execute(
                             select(PlaybackProgress).where(
@@ -1317,6 +1379,29 @@ async def _apply_trakt_import(
                             )
                         )
                     ).scalar_one_or_none()
+
+                    latest_watch_times = existing_times.get(media.id) or []
+                    if not paused_at:
+                        if existing_pp and existing_pp.updated_at:
+                            paused_at = existing_pp.updated_at
+                        elif latest_watch_times:
+                            stats["skipped"] += 1
+                            stats["skipped_playback_stale"] += 1
+                            continue
+                        else:
+                            paused_at = datetime(1970, 1, 1)
+
+                    if any(wt >= paused_at for wt in latest_watch_times):
+                        stats["skipped"] += 1
+                        stats["skipped_playback_stale"] += 1
+                        continue
+
+                    # If the user has already watched past this episode in this show, progress is stale
+                    furthest = furthest_watched_per_show.get(show.id)
+                    if furthest and (season_num, ep_num) < furthest:
+                        stats["skipped"] += 1
+                        stats["skipped_playback_stale"] += 1
+                        continue
 
                     runtime_mins = getattr(media, "runtime", None) or 0
                     progress_seconds = int(progress_percent * runtime_mins * 60) if runtime_mins > 0 else 0
@@ -1331,6 +1416,7 @@ async def _apply_trakt_import(
                         existing_pp.updated_at = paused_at
                         existing_pp.trakt_playback_id = pb_id
                         stats["playback_episodes"] += 1
+                        _new_playback.add(media.id)
                     else:
                         db.add(
                             PlaybackProgress(
@@ -1343,6 +1429,7 @@ async def _apply_trakt_import(
                             )
                         )
                         stats["playback_episodes"] += 1
+                        _new_playback.add(media.id)
             except Exception as exc:
                 logger.warning("Error processing Trakt episode playback progress s%se%s for tmdb=%s: %s", season_num, ep_num, show_tmdb_id, exc)
                 stats["errors"] += 1
@@ -1724,6 +1811,7 @@ async def _apply_trakt_import(
 
             await db.commit()
 
+    stats["new_playback_ids"] = _new_playback
     return stats, watched_processed, history_had_errors, _new_watched, _new_ratings
 
 
@@ -1901,8 +1989,19 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                 stats["dropped"] = await _apply_dropped_shows_import(db, user_id, dropped_items)
 
             print(_trakt_import_summary(job_id, "sync", stats))
-            # A pull only populates scrob's own data — it never automatically pushes to
-            # other connections; users push explicitly per-service (the "Push" buttons).
+            _new_playback = stats.get("new_playback_ids") or set()
+            try:
+                from routers.sync import _fan_out_changes_to_other_connections
+                await _fan_out_changes_to_other_connections(
+                    db,
+                    user_id,
+                    exclude_connection_id=None,
+                    new_watched_ids=_new_watched,
+                    new_ratings=_new_ratings,
+                    new_playback_media_ids=_new_playback,
+                )
+            except Exception as exc:
+                logger.warning("Trakt sync fan-out to other connections failed: %s", exc)
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
                     status=SyncStatus.completed,
