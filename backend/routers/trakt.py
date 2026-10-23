@@ -1890,7 +1890,7 @@ async def _apply_trakt_import(
 
             await db.commit()
 
-    stats["new_playback_ids"] = _new_playback
+    stats["new_playback_ids"] = list(_new_playback)
     return stats, watched_processed, history_had_errors, _new_watched, _new_ratings
 
 
@@ -2069,7 +2069,7 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                 stats["dropped"] = await _apply_dropped_shows_import(db, user_id, dropped_items)
 
             print(_trakt_import_summary(job_id, "sync", stats))
-            _new_playback = stats.get("new_playback_ids") or set()
+            _new_playback = set(stats.pop("new_playback_ids", None) or ())
             try:
                 from routers.sync import _fan_out_changes_to_other_connections
                 await _fan_out_changes_to_other_connections(
@@ -2236,6 +2236,7 @@ async def run_trakt_export_sync(
                 watched_processed += stats.get("comments", 0)
 
             print(_trakt_import_summary(job_id, "export import", stats))
+            stats.pop("new_playback_ids", None)
             # An import only populates scrob's own data — it never automatically pushes
             # to other connections; users push explicitly per-service (the "Push" buttons).
             await db.execute(

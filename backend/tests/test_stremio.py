@@ -770,6 +770,7 @@ class StremioLinkReconnectTests(unittest.IsolatedAsyncioTestCase):
             connection.watchlist_monitored_users = None
             connection.plex_sync_watchlist = False
             connection.plex_push_watchlist = False
+            connection.push_on_pull = True
 
         db = SimpleNamespace(
             execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
