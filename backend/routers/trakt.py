@@ -593,14 +593,33 @@ async def trakt_disconnect(
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
 
-async def _get_or_create_show(db: AsyncSession, tmdb_id: int, title: str, api_key: str | None) -> Show | None:
+async def _get_or_create_show(
+    db: AsyncSession,
+    tmdb_id: int,
+    title: str,
+    api_key: str | None,
+    imdb_id: str | None = None,
+) -> Show | None:
     result = await db.execute(select(Show).where(Show.tmdb_id == tmdb_id))
     show = result.scalars().first()
+    clean_imdb = str(imdb_id or "").strip()
+    valid_imdb = clean_imdb if clean_imdb.startswith("tt") and clean_imdb[2:].isdigit() else None
+
     if show:
+        if valid_imdb:
+            tmdb_data = dict(show.tmdb_data or {})
+            ext = dict(tmdb_data.get("external_ids") or {})
+            if not ext.get("imdb_id"):
+                ext["imdb_id"] = valid_imdb
+                tmdb_data["external_ids"] = ext
+                show.tmdb_data = tmdb_data
         return show
     from core import tmdb
     try:
         d = await tmdb.get_show(tmdb_id, api_key=api_key)
+        ext_ids = dict(d.get("external_ids", {}))
+        if valid_imdb and not ext_ids.get("imdb_id"):
+            ext_ids["imdb_id"] = valid_imdb
         show = Show(
             tmdb_id=tmdb_id,
             title=d.get("name") or title,
@@ -615,7 +634,7 @@ async def _get_or_create_show(db: AsyncSession, tmdb_id: int, title: str, api_ke
             last_air_date=d.get("last_air_date"),
             tmdb_data={
                 "genres": [g["name"] for g in d.get("genres", [])],
-                "external_ids": d.get("external_ids", {}),
+                "external_ids": ext_ids,
                 "original_language": d.get("original_language"),
                 "seasons": [
                     {
@@ -636,14 +655,41 @@ async def _get_or_create_show(db: AsyncSession, tmdb_id: int, title: str, api_ke
         return None
 
 
-async def _get_or_create_movie_media(db: AsyncSession, tmdb_id: int, title: str, api_key: str | None) -> Media | None:
+async def _get_or_create_movie_media(
+    db: AsyncSession,
+    tmdb_id: int,
+    title: str,
+    api_key: str | None,
+    imdb_id: str | None = None,
+) -> Media | None:
     result = await db.execute(
         select(Media).where(Media.tmdb_id == tmdb_id, Media.media_type == MediaType.movie)
     )
     media = result.scalars().first()
+    clean_imdb = str(imdb_id or "").strip()
+    valid_imdb = clean_imdb if clean_imdb.startswith("tt") and clean_imdb[2:].isdigit() else None
+
     if media:
+        if valid_imdb:
+            if not media.imdb_id:
+                media.imdb_id = valid_imdb
+            tmdb_data = dict(media.tmdb_data or {})
+            ext = dict(tmdb_data.get("external_ids") or {})
+            if not ext.get("imdb_id"):
+                ext["imdb_id"] = valid_imdb
+                tmdb_data["external_ids"] = ext
+                media.tmdb_data = tmdb_data
         return media
-    media, _created = await create_media_safely(db, tmdb_id, MediaType.movie, title=title)
+    fields = {"title": title}
+    if valid_imdb:
+        fields["imdb_id"] = valid_imdb
+    media, _created = await create_media_safely(db, tmdb_id, MediaType.movie, **fields)
+    if valid_imdb:
+        tmdb_data = dict(media.tmdb_data or {})
+        ext = dict(tmdb_data.get("external_ids") or {})
+        ext["imdb_id"] = valid_imdb
+        tmdb_data["external_ids"] = ext
+        media.tmdb_data = tmdb_data
     await enrich_media(media, api_key=api_key)
     return media
 
@@ -896,6 +942,7 @@ async def _apply_trakt_import(
     history_start: datetime | None,
     history_end: datetime | None,
     window_minutes: int = DEFAULT_DEDUP_WINDOW_MINUTES,
+    full_resync: bool = False,
 ) -> tuple[dict, int, bool, set[int], RatingChanges]:
     """Fetches (from `source`) and applies watched history, ratings, and lists.
 
@@ -978,6 +1025,7 @@ async def _apply_trakt_import(
         for movie_index, item in enumerate(history_movies, start=1):
             movie_data = item.get("movie", {})
             tmdb_id = movie_data.get("ids", {}).get("tmdb")
+            movie_imdb_id = movie_data.get("ids", {}).get("imdb")
             try:
                 if not tmdb_id:
                     stats["skipped"] += 1
@@ -986,7 +1034,9 @@ async def _apply_trakt_import(
                     continue
                 try:
                     async with db.begin_nested():
-                        media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
+                        media = await _get_or_create_movie_media(
+                            db, tmdb_id, movie_data.get("title", ""), api_key, imdb_id=movie_imdb_id
+                        )
                         if not media:
                             stats["errors"] += 1
                             _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', f"tmdb:{tmdb_id} not found")
@@ -1013,6 +1063,8 @@ async def _apply_trakt_import(
                             stats["skipped"] += 1
                             stats["skipped_duplicates"] += 1
                             stats["skipped_duplicates_movies"] += 1
+                            if full_resync:
+                                _new_watched.add(media.id)
                 except Exception as exc:
                     logger.warning("Error processing Trakt movie tmdb=%s: %s", tmdb_id, exc)
                     stats["errors"] += 1
@@ -1082,9 +1134,10 @@ async def _apply_trakt_import(
 
         async def process_show(show_tmdb_id: int, entries: list[dict]):
             show_title = entries[0].get("show", {}).get("title", "")
+            show_imdb_id = entries[0].get("show", {}).get("ids", {}).get("imdb")
             try:
                 async with db.begin_nested():
-                    show = await _get_or_create_show(db, show_tmdb_id, show_title, api_key)
+                    show = await _get_or_create_show(db, show_tmdb_id, show_title, api_key, imdb_id=show_imdb_id)
                     if not show:
                         stats["errors"] += 1
                         _note_unimported(stats, f'show "{show_title}"', f"tmdb:{show_tmdb_id} not found")
@@ -1136,6 +1189,8 @@ async def _apply_trakt_import(
                                 stats["skipped"] += 1
                                 stats["skipped_duplicates"] += 1
                                 stats["skipped_duplicates_episodes"] += 1
+                                if full_resync:
+                                    _new_watched.add(media.id)
                     except Exception as exc:
                         logger.warning("Error processing episode s%se%s for show tmdb=%s: %s", season_num, ep_num, show_tmdb_id, exc)
                         stats["errors"] += 1
@@ -1252,9 +1307,12 @@ async def _apply_trakt_import(
                 or _parse_trakt_datetime(entry.get("created_at"))
             )
 
+            movie_imdb_id = movie_data.get("ids", {}).get("imdb")
             try:
                 async with db.begin_nested():
-                    media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
+                    media = await _get_or_create_movie_media(
+                        db, tmdb_id, movie_data.get("title", ""), api_key, imdb_id=movie_imdb_id
+                    )
                     if not media:
                         stats["errors"] += 1
                         continue
@@ -1268,19 +1326,28 @@ async def _apply_trakt_import(
                         )
                     ).scalar_one_or_none()
 
-                    latest_watch_times = existing_times.get(media.id) or []
                     if not paused_at:
                         if existing_pp and existing_pp.updated_at:
                             paused_at = existing_pp.updated_at
-                        elif latest_watch_times:
-                            stats["skipped"] += 1
-                            stats["skipped_playback_stale"] += 1
-                            continue
                         else:
-                            paused_at = datetime(1970, 1, 1)
+                            paused_at = utcnow()
 
-                    # If this movie has already been completed at or after paused_at, progress is stale
-                    if any(wt >= paused_at for wt in latest_watch_times):
+                    # If this movie has already been completed after paused_at with a real watch timestamp, progress is stale
+                    recent_completed = (
+                        await db.execute(
+                            select(WatchEvent.id)
+                            .where(
+                                WatchEvent.user_id == user_id,
+                                WatchEvent.media_id == media.id,
+                                WatchEvent.completed == True,
+                                WatchEvent.watched_at.isnot(None),
+                                WatchEvent.watched_at > paused_at,
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+
+                    if recent_completed is not None:
                         stats["skipped"] += 1
                         stats["skipped_playback_stale"] += 1
                         continue
@@ -1360,7 +1427,9 @@ async def _apply_trakt_import(
 
             try:
                 async with db.begin_nested():
-                    show = await _get_or_create_show(db, show_tmdb_id, show_data.get("title", ""), api_key)
+                    show = await _get_or_create_show(
+                        db, show_tmdb_id, show_data.get("title", ""), api_key, imdb_id=show_data.get("ids", {}).get("imdb")
+                    )
                     if not show:
                         stats["errors"] += 1
                         continue
@@ -1380,18 +1449,28 @@ async def _apply_trakt_import(
                         )
                     ).scalar_one_or_none()
 
-                    latest_watch_times = existing_times.get(media.id) or []
                     if not paused_at:
                         if existing_pp and existing_pp.updated_at:
                             paused_at = existing_pp.updated_at
-                        elif latest_watch_times:
-                            stats["skipped"] += 1
-                            stats["skipped_playback_stale"] += 1
-                            continue
                         else:
-                            paused_at = datetime(1970, 1, 1)
+                            paused_at = utcnow()
 
-                    if any(wt >= paused_at for wt in latest_watch_times):
+                    # If this episode has already been completed after paused_at with a real watch timestamp, progress is stale
+                    recent_completed = (
+                        await db.execute(
+                            select(WatchEvent.id)
+                            .where(
+                                WatchEvent.user_id == user_id,
+                                WatchEvent.media_id == media.id,
+                                WatchEvent.completed == True,
+                                WatchEvent.watched_at.isnot(None),
+                                WatchEvent.watched_at > paused_at,
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+
+                    if recent_completed is not None:
                         stats["skipped"] += 1
                         stats["skipped_playback_stale"] += 1
                         continue
@@ -1979,6 +2058,7 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                 history_start,
                 history_end,
                 dedup_window_from_settings(settings),
+                full_resync=full_resync,
             )
 
             if settings.trakt_sync_watched and not history_had_errors:

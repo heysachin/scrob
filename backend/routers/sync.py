@@ -646,6 +646,11 @@ def _nuvio_profile_id(conn: MediaServerConnection) -> int:
 def _nuvio_imdb_id(entity: Media | Show | None) -> str | None:
     if entity is None:
         return None
+    direct = getattr(entity, "imdb_id", None)
+    if direct:
+        direct_str = str(direct).strip()
+        if direct_str.startswith("tt") and direct_str[2:].isdigit():
+            return direct_str
     data = entity.tmdb_data or {}
     value = data.get("imdb_id") or (data.get("external_ids") or {}).get("imdb_id")
     imdb_id = str(value or "").strip()
@@ -703,6 +708,8 @@ async def _ensure_nuvio_imdb_ids(
         stored_external_ids["imdb_id"] = imdb_id
         tmdb_data["external_ids"] = stored_external_ids
         entity.tmdb_data = tmdb_data
+        if hasattr(entity, "imdb_id"):
+            entity.imdb_id = imdb_id
 
     await asyncio.gather(
         *[

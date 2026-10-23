@@ -165,3 +165,61 @@ class NuvioAutoPushAndTimingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(items), 1)
                 self.assertEqual(items[0]["content_id"], "tt9999999")
                 self.assertEqual(items[0]["content_type"], "movie")
+
+    # 4. Test _nuvio_imdb_id resolves directly from Media.imdb_id even without tmdb_data
+    def test_nuvio_imdb_id_resolves_from_direct_column(self):
+        movie_with_direct_imdb = Media(id=401, media_type=MediaType.movie, title="Direct IMDb Movie", imdb_id="tt1122334", tmdb_data=None)
+        self.assertEqual(sync_router._nuvio_imdb_id(movie_with_direct_imdb), "tt1122334")
+
+        watched_item = sync_router._nuvio_watched_item(movie_with_direct_imdb, datetime(2026, 10, 23, 10, 0, 0))
+        self.assertIsNotNone(watched_item)
+        self.assertEqual(watched_item["content_id"], "tt1122334")
+        self.assertEqual(watched_item["content_type"], "movie")
+
+        progress = PlaybackProgress(user_id=1, media_id=401, progress_percent=0.5, progress_seconds=3600, updated_at=datetime(2026, 10, 23, 10, 0, 0))
+        progress_item = sync_router._nuvio_progress_item(progress, movie_with_direct_imdb)
+        self.assertIsNotNone(progress_item)
+        self.assertEqual(progress_item["content_id"], "tt1122334")
+        self.assertEqual(progress_item["content_type"], "movie")
+
+    # 5. Test Trakt playback movies are NOT skipped by past completed watch events (only strictly newer watches)
+    async def test_trakt_playback_movie_not_skipped_by_past_watch(self):
+        async with self.Session() as s:
+            movie = Media(id=501, tmdb_id=5001, media_type=MediaType.movie, title="Rewatched Movie", imdb_id="tt5001")
+            s.add(movie)
+            # Past completed watch from Monday
+            s.add(WatchEvent(user_id=1, media_id=501, completed=True, watched_at=datetime(2026, 10, 20, 10, 0, 0)))
+            job = trakt_router.SyncJob(id=501, user_id=1, source="trakt", status="pending")
+            s.add(job)
+            await s.commit()
+
+            class TraktPlaybackSource:
+                async def get_history_movies(self, start_at=None, end_at=None): return []
+                async def get_history_episodes(self, start_at=None, end_at=None): return []
+                async def get_playback_episodes(self): return []
+                async def get_ratings(self): return {}
+                async def get_watchlist(self): return []
+                async def get_user_lists(self): return []
+                async def get_playback_movies(self):
+                    return [{
+                        "id": 9991,
+                        "progress": 40.0,
+                        "paused_at": "2026-10-23T15:00:00.000Z",
+                        "type": "movie",
+                        "movie": {
+                            "title": "Rewatched Movie",
+                            "ids": {"tmdb": 5001, "imdb": "tt5001"},
+                        },
+                    }]
+
+            stats, _, _, new_watched, _ = await trakt_router._apply_trakt_import(
+                s, job_id=501, user_id=1, source=TraktPlaybackSource(), api_key=None,
+                sync_watched=True, sync_ratings=False, sync_lists=False, split_watchlist=False,
+                history_start=None, history_end=None,
+            )
+
+            self.assertEqual(stats["playback_movies"], 1)
+            self.assertEqual(stats.get("skipped_playback_stale", 0), 0)
+            pps = (await s.execute(select(PlaybackProgress).where(PlaybackProgress.media_id == 501))).scalars().all()
+            self.assertEqual(len(pps), 1)
+            self.assertEqual(pps[0].progress_percent, 0.40)

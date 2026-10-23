@@ -413,7 +413,7 @@ async def get_history(
     # path. Constrain every history query to the two real types so those rows
     # can't surface (they previously leaked into the unfiltered "All" tab and
     # then 404'd trying to open as a movie). See #358.
-    type_filter = [type] if type in ("movie", "episode") else ["movie", "episode"]
+    type_filter = [MediaType(type)] if type in ("movie", "episode") else [MediaType.movie, MediaType.episode]
 
     # A show's title lives on Show, not on its episode Media rows (those only
     # carry the episode's own title) - so a search for the show name has to
@@ -770,14 +770,14 @@ async def get_continue_watching(
     for progress, media in rows:
         if media.media_type == MediaType.movie:
             wat = latest_watched_by_media.get(media.id)
-            if wat and wat >= progress.updated_at:
+            if wat and wat > progress.updated_at:
                 stale_progress_ids.append(progress.id)
                 continue
             activity_at = progress.updated_at
             valid_rows.append((progress, media, activity_at))
         elif media.media_type == MediaType.episode:
             wat = latest_watched_by_media.get(media.id)
-            if wat and wat >= progress.updated_at:
+            if wat and wat > progress.updated_at:
                 stale_progress_ids.append(progress.id)
                 continue
             if media.show_id:
