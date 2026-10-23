@@ -347,3 +347,48 @@ class NuvioAutoPushAndTimingTests(unittest.IsolatedAsyncioTestCase):
             with patch("core.nuvio.push_watch_progress", AsyncMock()) as mock_push_progress:
                 await sync_router._push_nuvio_playback_progress(s, user_id=1, media_ids=[901])
                 self.assertEqual(mock_push_progress.call_count, 1)
+
+    # 10. Test _build_nuvio_progress_items sorts oldest to newest (ascending) so latest watch is pushed last
+    async def test_nuvio_progress_items_sorted_chronological_ascending(self):
+        async with self.Session() as s:
+            movie1 = Media(id=1001, media_type=MediaType.movie, title="Older Movie", imdb_id="tt1001")
+            movie2 = Media(id=1002, media_type=MediaType.movie, title="Newer Movie", imdb_id="tt1002")
+            movie3 = Media(id=1003, media_type=MediaType.movie, title="Latest Movie", imdb_id="tt1003")
+            s.add_all([movie1, movie2, movie3])
+
+            # Oldest watched: 10:00, Mid: 12:00, Latest: 14:00
+            s.add(PlaybackProgress(user_id=1, media_id=1001, progress_percent=0.5, progress_seconds=3000, updated_at=datetime(2026, 10, 23, 10, 0, 0)))
+            s.add(PlaybackProgress(user_id=1, media_id=1002, progress_percent=0.5, progress_seconds=3000, updated_at=datetime(2026, 10, 23, 12, 0, 0)))
+            s.add(PlaybackProgress(user_id=1, media_id=1003, progress_percent=0.5, progress_seconds=3000, updated_at=datetime(2026, 10, 23, 14, 0, 0)))
+            await s.commit()
+
+            items = await sync_router._build_nuvio_progress_items(s, user_id=1, media_ids={1001, 1002, 1003})
+            self.assertEqual(len(items), 3)
+            # Oldest first, latest last
+            self.assertEqual(items[0]["content_id"], "tt1001")
+            self.assertEqual(items[1]["content_id"], "tt1002")
+            self.assertEqual(items[2]["content_id"], "tt1003")
+            self.assertLess(items[0]["last_watched"], items[1]["last_watched"])
+            self.assertLess(items[1]["last_watched"], items[2]["last_watched"])
+
+    # 11. Test _build_nuvio_watched_entries sorts oldest to newest (ascending) so latest watch is pushed last
+    async def test_nuvio_watched_entries_sorted_chronological_ascending(self):
+        async with self.Session() as s:
+            movie1 = Media(id=1101, media_type=MediaType.movie, title="Older Watched Movie", imdb_id="tt1101")
+            movie2 = Media(id=1102, media_type=MediaType.movie, title="Newer Watched Movie", imdb_id="tt1102")
+            movie3 = Media(id=1103, media_type=MediaType.movie, title="Latest Watched Movie", imdb_id="tt1103")
+            s.add_all([movie1, movie2, movie3])
+
+            s.add(WatchEvent(user_id=1, media_id=1101, completed=True, watched_at=datetime(2026, 6, 14, 10, 0, 0)))
+            s.add(WatchEvent(user_id=1, media_id=1102, completed=True, watched_at=datetime(2026, 7, 1, 12, 0, 0)))
+            s.add(WatchEvent(user_id=1, media_id=1103, completed=True, watched_at=datetime(2026, 10, 23, 14, 0, 0)))
+            await s.commit()
+
+            entries = await sync_router._build_nuvio_watched_entries(s, user_id=1, media_ids={1101, 1102, 1103})
+            self.assertEqual(len(entries), 3)
+            # Oldest first, latest last
+            self.assertEqual(entries[0][1]["content_id"], "tt1101")
+            self.assertEqual(entries[1][1]["content_id"], "tt1102")
+            self.assertEqual(entries[2][1]["content_id"], "tt1103")
+            self.assertLess(entries[0][1]["watched_at"], entries[1][1]["watched_at"])
+            self.assertLess(entries[1][1]["watched_at"], entries[2][1]["watched_at"])
