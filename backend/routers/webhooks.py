@@ -704,6 +704,12 @@ async def _update_playback_progress(
             progress_seconds=progress_seconds,
             updated_at=utcnow(),
         ))
+    await db.flush()
+    try:
+        from routers.sync import _push_nuvio_playback_progress
+        await _push_nuvio_playback_progress(db, user_id, [media_id])
+    except Exception as exc:
+        logger.warning("Failed to auto-push progress to Nuvio for user %s: %s", user_id, exc)
 
 
 async def _write_watch_event(

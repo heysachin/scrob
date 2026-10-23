@@ -981,14 +981,25 @@ def _nuvio_progress_item(
         progress_percent = float(progress.progress_percent)
     except (TypeError, ValueError):
         return None
-    if progress_seconds <= 0 or progress_percent <= 0:
+    if progress_seconds <= 0 and progress_percent <= 0:
         return None
 
-    position_ms = progress_seconds * 1000
-    if media.runtime and media.runtime > 0:
-        duration_ms = media.runtime * 60_000
+    default_runtime = 120 if media.media_type == MediaType.movie else 45
+    effective_runtime = media.runtime if (media.runtime and media.runtime > 0) else default_runtime
+
+    if progress_seconds > 0 and progress_percent > 0:
+        position_ms = progress_seconds * 1000
+        if media.runtime and media.runtime > 0:
+            duration_ms = media.runtime * 60_000
+        else:
+            duration_ms = round(position_ms / max(min(progress_percent, 1.0), 0.01))
+    elif progress_seconds > 0:
+        position_ms = progress_seconds * 1000
+        duration_ms = effective_runtime * 60_000
     else:
-        duration_ms = round(position_ms / max(min(progress_percent, 1.0), 0.01))
+        duration_ms = effective_runtime * 60_000
+        position_ms = max(1000, round(duration_ms * min(max(progress_percent, 0.01), 1.0)))
+
     duration_ms = max(position_ms, duration_ms)
 
     updated_at = progress.updated_at
@@ -1028,31 +1039,145 @@ async def _build_nuvio_progress_items(
     db: AsyncSession,
     user_id: int,
     api_key: str | None = None,
+    media_ids: set[int] | None = None,
 ) -> list[dict]:
-    result = await db.execute(
+    query = (
         select(PlaybackProgress, Media)
         .join(Media, Media.id == PlaybackProgress.media_id)
         .where(PlaybackProgress.user_id == user_id)
-        .order_by(Media.id)
+        .order_by(PlaybackProgress.updated_at.desc())
     )
+    if media_ids is not None:
+        if not media_ids:
+            return []
+        query = query.where(PlaybackProgress.media_id.in_(media_ids))
+    result = await db.execute(query)
     rows = result.all()
+    if not rows:
+        return []
+
+    # Filter out stale items completed in WatchEvent
+    all_row_media_ids = [m.id for _, m in rows]
+    watched_query = (
+        select(WatchEvent.media_id, WatchEvent.watched_at)
+        .where(WatchEvent.user_id == user_id, WatchEvent.completed == True, WatchEvent.media_id.in_(all_row_media_ids))
+    )
+    watched_res = await db.execute(watched_query)
+    latest_watch_by_media: dict[int, datetime] = {}
+    for mid, wat in watched_res.all():
+        if wat and (mid not in latest_watch_by_media or wat > latest_watch_by_media[mid]):
+            latest_watch_by_media[mid] = wat
+
     show_ids = {
         media.show_id
         for _, media in rows
         if media.media_type == MediaType.episode and media.show_id is not None
     }
     shows_by_id: dict[int, Show] = {}
+    furthest_watched_by_show: dict[int, tuple[int, int]] = {}
     if show_ids:
         shows_result = await db.execute(select(Show).where(Show.id.in_(show_ids)))
         shows_by_id = {show.id: show for show in shows_result.scalars().all()}
-    await _ensure_nuvio_imdb_ids([media for _, media in rows], shows_by_id, api_key)
+
+        show_ep_query = (
+            select(Media.show_id, Media.season_number, Media.episode_number)
+            .join(WatchEvent, WatchEvent.media_id == Media.id)
+            .where(
+                WatchEvent.user_id == user_id,
+                WatchEvent.completed == True,
+                Media.show_id.in_(show_ids),
+                Media.season_number.isnot(None),
+                Media.episode_number.isnot(None),
+            )
+            .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
+        )
+        for sid, snum, enum in (await db.execute(show_ep_query)).all():
+            if sid not in furthest_watched_by_show:
+                furthest_watched_by_show[sid] = (snum, enum)
+
+    valid_rows: list[tuple[PlaybackProgress, Media]] = []
+    seen_shows: set[int] = set()
+
+    for progress, media in rows:
+        if media.media_type == MediaType.movie:
+            wat = latest_watch_by_media.get(media.id)
+            if wat and wat >= progress.updated_at:
+                continue
+            valid_rows.append((progress, media))
+        elif media.media_type == MediaType.episode:
+            wat = latest_watch_by_media.get(media.id)
+            if wat and wat >= progress.updated_at:
+                continue
+            if media.show_id:
+                furthest = furthest_watched_by_show.get(media.show_id)
+                if furthest and media.season_number is not None and media.episode_number is not None:
+                    if (media.season_number, media.episode_number) < furthest:
+                        continue
+                if media.show_id in seen_shows:
+                    continue
+                seen_shows.add(media.show_id)
+            valid_rows.append((progress, media))
+        else:
+            valid_rows.append((progress, media))
+
+    await _ensure_nuvio_imdb_ids([media for _, media in valid_rows], shows_by_id, api_key)
 
     items: list[dict] = []
-    for progress, media in rows:
+    for progress, media in valid_rows:
         item = _nuvio_progress_item(progress, media, shows_by_id.get(media.show_id))
         if item:
             items.append(item)
+
+    items.sort(key=lambda x: x.get("last_watched", 0), reverse=True)
     return items
+
+
+async def _push_nuvio_playback_progress(
+    db: AsyncSession,
+    user_id: int,
+    media_ids: list[int] | set[int] | None = None,
+    exclude_connection_id: int | None = None,
+) -> None:
+    """Push playback progress directly to all Nuvio connections with push_playback enabled."""
+    conns_filter = [
+        MediaServerConnection.user_id == user_id,
+        MediaServerConnection.type == "nuvio",
+        MediaServerConnection.push_playback == True,
+    ]
+    if exclude_connection_id is not None:
+        conns_filter.append(MediaServerConnection.id != exclude_connection_id)
+    conns_res = await db.execute(select(MediaServerConnection).where(*conns_filter))
+    conns = conns_res.scalars().all()
+    if not conns:
+        return
+
+    settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+    user_settings = settings_result.scalar_one_or_none()
+    api_key = await _get_effective_tmdb_key(db, user_settings)
+
+    progress_items = await _build_nuvio_progress_items(
+        db, user_id, api_key=api_key, media_ids=set(media_ids) if media_ids else None
+    )
+    if not progress_items:
+        return
+
+    for conn in conns:
+        try:
+            async def _persist_refresh(session: nuvio.NuvioSession, c=conn) -> None:
+                c.token = session.refresh_token
+                await db.commit()
+
+            async with nuvio.connection_lock(conn.id):
+                await db.refresh(conn)
+                await nuvio.push_watch_progress(
+                    conn.url,
+                    conn.token,
+                    _nuvio_profile_id(conn),
+                    progress_items,
+                    on_refresh=_persist_refresh,
+                )
+        except Exception as exc:
+            logger.warning("Can't push playback progress to Nuvio connection %s: %s", conn.id, exc)
 
 
 async def _fan_out_changes_to_other_connections(
@@ -1066,6 +1191,7 @@ async def _fan_out_changes_to_other_connections(
     removed_ratings: set[RatingKey] | None = None,
     new_collected_ids: set[int] | None = None,
     removed_collected_ids: set[int] | None = None,
+    new_playback_media_ids: set[int] | None = None,
 ) -> None:
     """Push an inbound sync delta to every enabled media server and cloud target.
 
@@ -1075,7 +1201,15 @@ async def _fan_out_changes_to_other_connections(
     removed_ratings = removed_ratings or set()
     new_collected_ids = new_collected_ids or set()
     removed_collected_ids = removed_collected_ids or set()
-    if not new_watched_ids and not new_ratings and not removed_ratings and not new_collected_ids and not removed_collected_ids:
+    new_playback_media_ids = new_playback_media_ids or set()
+    if (
+        not new_watched_ids
+        and not new_ratings
+        and not removed_ratings
+        and not new_collected_ids
+        and not removed_collected_ids
+        and not new_playback_media_ids
+    ):
         return
 
     from routers.webhooks import mark_pushed_watched
@@ -1086,6 +1220,7 @@ async def _fan_out_changes_to_other_connections(
         | {media_id for media_id, _ in removed_ratings}
         | new_collected_ids
         | removed_collected_ids
+        | new_playback_media_ids
     )
     media_items = await _select_in_chunks(
         db,
@@ -1158,14 +1293,15 @@ async def _fan_out_changes_to_other_connections(
                 return await coro
 
         nuvio_watched_items: list[dict] | None = None
+        nuvio_progress_items: list[dict] | None = None
         has_nuvio_collection_target = any(
-            conn.type == "nuvio" and conn.push_collection
+            conn.type == "nuvio" and getattr(conn, "push_collection", False)
             for conn in push_candidates
         )
         nuvio_api_key = (
             await _get_effective_tmdb_key(db, settings)
             if any(
-                conn.type == "nuvio" and (conn.push_watched or conn.push_collection)
+                conn.type == "nuvio" and (conn.push_watched or getattr(conn, "push_collection", False) or getattr(conn, "push_playback", False))
                 for conn in push_candidates
             )
             else None
@@ -1246,6 +1382,22 @@ async def _fan_out_changes_to_other_connections(
                 )
             return True
 
+        async def _push_progress_to_nuvio(conn: MediaServerConnection, items: list[dict]) -> bool:
+            async def _persist_refresh(session: nuvio.NuvioSession) -> None:
+                conn.token = session.refresh_token
+                await db.commit()
+
+            async with nuvio.connection_lock(conn.id):
+                await db.refresh(conn)
+                await nuvio.push_watch_progress(
+                    conn.url,
+                    conn.token,
+                    _nuvio_profile_id(conn),
+                    items,
+                    on_refresh=_persist_refresh,
+                )
+            return True
+
         watched_at_by_media = await _latest_watched_at(db, user_id, list(new_watched_ids)) if new_watched_ids else {}
 
         for conn in push_candidates:
@@ -1265,7 +1417,7 @@ async def _fan_out_changes_to_other_connections(
                     )
                 continue
             if conn.type == "nuvio":
-                if conn.push_watched:
+                if conn.push_watched and new_watched_ids:
                     if nuvio_watched_items is None:
                         nuvio_watched_items = await _build_nuvio_watched_items(
                             db,
@@ -1286,6 +1438,16 @@ async def _fan_out_changes_to_other_connections(
                             )
                         )
                     )
+                if getattr(conn, "push_playback", False) and new_playback_media_ids:
+                    if nuvio_progress_items is None:
+                        nuvio_progress_items = await _build_nuvio_progress_items(
+                            db,
+                            user_id,
+                            api_key=nuvio_api_key,
+                            media_ids=new_playback_media_ids,
+                        )
+                    if nuvio_progress_items:
+                        push_tasks.append(_guarded(_push_progress_to_nuvio(conn, nuvio_progress_items)))
                 continue
             if conn.push_watched:
                 for mid in new_watched_ids:
