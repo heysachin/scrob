@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from pydantic import BaseModel, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import text, select, update, delete, func, cast, bindparam, DateTime, literal_column, or_
+from sqlalchemy import text, select, update, delete, func, cast, bindparam, DateTime, literal_column, or_, desc
 from sqlalchemy.orm import selectinload
 from sqlalchemy.dialects.postgresql import insert, JSONB
 
@@ -1096,7 +1096,7 @@ async def _build_nuvio_progress_items(
                 Media.season_number.isnot(None),
                 Media.episode_number.isnot(None),
             )
-            .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
+            .order_by(Media.show_id, Media.season_number.desc(), Media.episode_number.desc())
         )
         for sid, snum, enum in (await db.execute(show_ep_query)).all():
             if sid not in furthest_watched_by_show:

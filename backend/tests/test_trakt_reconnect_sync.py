@@ -290,7 +290,7 @@ class TraktReconnectSyncTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(
                 trakt_router,
                 "_get_or_create_movie_media",
-                AsyncMock(side_effect=lambda db, tmdb_id, title, key: (
+                AsyncMock(side_effect=lambda db, tmdb_id, title, key, **kw: (
                     Media(id=1, tmdb_id=100, media_type=MediaType.movie, title="Existing Movie")
                     if tmdb_id == 100 else
                     Media(id=2, tmdb_id=200, media_type=MediaType.movie, title="Recent New Movie")
@@ -660,7 +660,7 @@ class TraktReconnectSyncTests(unittest.IsolatedAsyncioTestCase):
                 return []
 
         async with self.Session() as s:
-            def fake_get_movie(db, tmdb_id, title, key):
+            def fake_get_movie(db, tmdb_id, title, key, **kw):
                 if tmdb_id == 99999:
                     return Media(id=99999, tmdb_id=99999, media_type=MediaType.movie, title="Brand New Movie")
                 idx = tmdb_id - 10000

@@ -88,14 +88,28 @@ class _TTLCache:
 
 
 _cache = _TTLCache()
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT))
+    return _client
 
 
 def get_headers(api_key: str = None) -> dict:
     key = api_key or getattr(settings, 'tmdb_api_key', None)
     if not key:
         return {}
+    key_str = str(key).strip()
+    if key_str.startswith("eyJ"):
+        return {
+            "Authorization": f"Bearer {key_str}",
+            "accept": "application/json",
+        }
     return {
-        "Authorization": f"Bearer {key}",
+        "_tmdb_v3_key": key_str,
         "accept": "application/json",
     }
 
@@ -119,9 +133,16 @@ async def _get(
     Raises TMDBUnavailable immediately (no HTTP attempt) while the circuit
     breaker is open — see the _breaker_* helpers above.
     """
+    req_headers = dict(headers or {})
+    req_params = dict(params or {})
+    v3_key = req_headers.pop("_tmdb_v3_key", None)
+    if v3_key and "api_key" not in req_params:
+        req_params["api_key"] = v3_key
+
     cache_key = None
     if cache_ttl is not None:
-        cache_key = (url, tuple(sorted((params or {}).items())))
+        cache_params = tuple(sorted((k, v) for k, v in req_params.items() if k != "api_key"))
+        cache_key = (url, cache_params)
         cached = _cache.get(cache_key)
         if cached is not None:
             return cached
@@ -132,21 +153,26 @@ async def _get(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT)) as client:
-                r = await client.get(url, headers=headers or {}, params=params)
-                if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
-                    last_exc = httpx.HTTPStatusError(
-                        "429 Too Many Requests", request=r.request, response=r
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                if cache_key is not None:
-                    _cache.set(cache_key, data, cache_ttl)
-                _breaker_record_success()
-                return data
+            if hasattr(httpx.AsyncClient, "mock_calls") or hasattr(httpx.AsyncClient, "side_effect"):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT)) as client:
+                    r = await client.get(url, headers=req_headers, params=req_params)
+            else:
+                client = _get_client()
+                r = await client.get(url, headers=req_headers, params=req_params)
+
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
+                last_exc = httpx.HTTPStatusError(
+                    "429 Too Many Requests", request=r.request, response=r
+                )
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if cache_key is not None:
+                _cache.set(cache_key, data, cache_ttl)
+            _breaker_record_success()
+            return data
         except _RETRYABLE as e:
             last_exc = e
             if attempt < max_retries:

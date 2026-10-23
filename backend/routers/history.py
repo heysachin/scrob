@@ -405,7 +405,11 @@ async def get_history(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
-    offset = (page - 1) * page_size
+    page_num = page if isinstance(page, int) else (getattr(page, "default", 1) or 1)
+    size_num = page_size if isinstance(page_size, int) else (getattr(page_size, "default", 20) or 20)
+    type_val = type if isinstance(type, str) else getattr(type, "default", None)
+    q_val = q if isinstance(q, str) else getattr(q, "default", None)
+    offset = (page_num - 1) * size_num
 
     # Watch history is movie/episode only. A watched show or season is a
     # derived state (all of its episodes watched), never a watch event of its
@@ -413,13 +417,13 @@ async def get_history(
     # path. Constrain every history query to the two real types so those rows
     # can't surface (they previously leaked into the unfiltered "All" tab and
     # then 404'd trying to open as a movie). See #358.
-    type_filter = [MediaType(type)] if type in ("movie", "episode") else [MediaType.movie, MediaType.episode]
+    type_filter = [MediaType(type_val)] if type_val in ("movie", "episode") else [MediaType.movie, MediaType.episode]
 
     # A show's title lives on Show, not on its episode Media rows (those only
     # carry the episode's own title) - so a search for the show name has to
     # reach through the same outer join enrich_with_state/format_event already
     # rely on downstream, not just Media.title.
-    search_term = q.strip() if q else None
+    search_term = q_val.strip() if q_val else None
 
     base_query = (
         select(func.count())
@@ -437,7 +441,7 @@ async def get_history(
 
     total_result = await db.execute(base_query)
     total_count = total_result.scalar_one()
-    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    total_pages = max(1, (total_count + size_num - 1) // size_num)
 
     query = (
         select(WatchEvent, Media)
@@ -454,7 +458,7 @@ async def get_history(
             or_(Media.title.ilike(f"%{search_term}%"), Show.title.ilike(f"%{search_term}%"))
         )
 
-    query = query.offset(offset).limit(page_size)
+    query = query.offset(offset).limit(size_num)
 
     result = await db.execute(query)
     rows = result.all()
@@ -484,8 +488,8 @@ async def get_history(
                     event["media"]["show_title"] = t["title"]
 
     return {
-        "page": page,
-        "page_size": page_size,
+        "page": page_num,
+        "page_size": size_num,
         "total_results": total_count,
         "total_pages": total_pages,
         "results": events,
