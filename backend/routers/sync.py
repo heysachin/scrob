@@ -975,6 +975,11 @@ async def _build_nuvio_watched_entries(
         )
         if item:
             entries.append((media.id, item))
+
+    # Sort entries chronologically ascending (oldest -> newest) so that the most
+    # recently watched item is pushed last. If Nuvio orders watch history by
+    # insertion order / created_at DESC, the newest watch appears at the top.
+    entries.sort(key=lambda entry: entry[1].get("watched_at") or 0)
     return entries
 
 
@@ -1135,7 +1140,11 @@ async def _build_nuvio_progress_items(
         if item:
             items.append(item)
 
-    items.sort(key=lambda x: x.get("last_watched", 0), reverse=True)
+    # Sort items chronologically ascending (oldest -> newest) so that the most
+    # recently watched item is pushed last. Nuvio orders continue watching by
+    # server update timestamp (updated_at DESC) / insertion order, so the last item
+    # pushed receives the newest server timestamp and appears first in Nuvio (#433).
+    items.sort(key=lambda x: x.get("last_watched", 0))
     return items
 
 
